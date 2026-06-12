@@ -14,7 +14,20 @@ DAY_START = "09:00"
 DAY_END = "18:00"
 LUNCH_START = "12:00"
 LUNCH_END = "13:00"
-SLOT_MINUTES = 5  # 5 min total per athlete (performance + transition)
+SLOT_MINUTES = 5  # default: 5 min total per athlete (performance + transition)
+
+# Per-ring slot overrides. Rings not listed here use SLOT_MINUTES.
+RING_SLOT_MINUTES = {
+    "Lion Dance Stage": 15,
+}
+
+# Rings that should split their athletes evenly across the 2 event days
+# instead of filling Saturday first.
+BALANCE_RINGS = {"Sanda Ring"}
+
+
+def slot_for_ring(ring):
+    return RING_SLOT_MINUTES.get(ring, SLOT_MINUTES)
 
 FIXED_RINGS = {
     "Sanda": "Sanda Ring",
@@ -84,8 +97,10 @@ def classify_ring(event_category):
     return None
 
 
-def _ring_capacity(slot_minutes=SLOT_MINUTES):
+def _ring_capacity(slot_minutes=None, ring=None):
     """How many athletes one ring can hold across both event days."""
+    if slot_minutes is None:
+        slot_minutes = slot_for_ring(ring) if ring else SLOT_MINUTES
     day_start_min = _time_to_minutes(DAY_START)
     day_end_min = _time_to_minutes(DAY_END)
     lunch_minutes = _time_to_minutes(LUNCH_END) - _time_to_minutes(LUNCH_START)
@@ -172,10 +187,28 @@ def _minutes_to_time(m):
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
-def build_schedule(df, slot_minutes=SLOT_MINUTES):
+def _split_point_for_balance(n_athletes, ring_slot):
+    """
+    Return how many athletes belong on day 1 (Saturday) when balancing across
+    both event days. Ceiling-split so day 1 gets the larger half if odd, but
+    cap at the per-day capacity.
+    """
+    day_start_min = _time_to_minutes(DAY_START)
+    day_end_min = _time_to_minutes(DAY_END)
+    lunch_minutes = _time_to_minutes(LUNCH_END) - _time_to_minutes(LUNCH_START)
+    minutes_per_day = (day_end_min - day_start_min) - lunch_minutes
+    per_day_capacity = minutes_per_day // ring_slot
+
+    half = (n_athletes + 1) // 2
+    return min(half, per_day_capacity)
+
+
+def build_schedule(df, slot_minutes=None):
     """
     Walk each ring's queue, assign Day + start time to every athlete.
     Skip 12:00-13:00 lunch hour. Spread across both days if needed.
+    Per-ring slot overrides come from slot_for_ring() (e.g. Lion Dance = 15 min).
+    Rings in BALANCE_RINGS split their athletes evenly across both days.
     """
     df = df.copy()
     if "ring" not in df.columns:
@@ -192,16 +225,29 @@ def build_schedule(df, slot_minutes=SLOT_MINUTES):
         if ring_df.empty:
             continue
 
-        ring_df = ring_df.sort_values(["event_category", "division", "athlete"]).reset_index(drop=True)
+        ring_slot = slot_minutes if slot_minutes is not None else slot_for_ring(ring)
+
+        ring_df["__div_letter"] = ring_df["division"].astype(str).str.strip().str[:1].str.upper()
+        ring_df = ring_df.sort_values(
+            ["__div_letter", "division", "athlete"]
+        ).drop(columns="__div_letter").reset_index(drop=True)
+
+        balance = ring in BALANCE_RINGS
+        split_at = _split_point_for_balance(len(ring_df), ring_slot) if balance else None
 
         day_idx = 0
         cursor = day_start_min
-        for _, row in ring_df.iterrows():
+        for i, (_, row) in enumerate(ring_df.iterrows()):
+            # Force a day change at the split point for balancing rings.
+            if balance and i == split_at and day_idx == 0:
+                day_idx = 1
+                cursor = day_start_min
+
             placed = False
             while day_idx < len(EVENT_DAYS):
-                if cursor < lunch_end_min and cursor + slot_minutes > lunch_start_min:
+                if cursor < lunch_end_min and cursor + ring_slot > lunch_start_min:
                     cursor = lunch_end_min
-                if cursor + slot_minutes > day_end_min:
+                if cursor + ring_slot > day_end_min:
                     day_idx += 1
                     cursor = day_start_min
                     continue
@@ -209,10 +255,10 @@ def build_schedule(df, slot_minutes=SLOT_MINUTES):
                     **row.to_dict(),
                     "day": EVENT_DAYS[day_idx],
                     "start_time": _minutes_to_time(cursor),
-                    "end_time": _minutes_to_time(cursor + slot_minutes),
+                    "end_time": _minutes_to_time(cursor + ring_slot),
                     "order_in_ring": len(rows),
                 })
-                cursor += slot_minutes
+                cursor += ring_slot
                 placed = True
                 break
             if not placed:
@@ -228,21 +274,32 @@ def build_schedule(df, slot_minutes=SLOT_MINUTES):
     return schedule
 
 
-def renumber_ring(schedule, ring, slot_minutes=SLOT_MINUTES):
+def renumber_ring(schedule, ring, slot_minutes=None):
     """Recompute day + start_time for every athlete in one ring after a reorder."""
     schedule = schedule.copy()
     ring_mask = schedule["ring"] == ring
     ring_df = schedule[ring_mask].sort_values("order_in_ring").reset_index()
+
+    if slot_minutes is None:
+        slot_minutes = slot_for_ring(ring)
 
     day_start_min = _time_to_minutes(DAY_START)
     day_end_min = _time_to_minutes(DAY_END)
     lunch_start_min = _time_to_minutes(LUNCH_START)
     lunch_end_min = _time_to_minutes(LUNCH_END)
 
+    balance = ring in BALANCE_RINGS
+    split_at = _split_point_for_balance(len(ring_df), slot_minutes) if balance else None
+
     day_idx = 0
     cursor = day_start_min
-    for _, row in ring_df.iterrows():
+    for i, (_, row) in enumerate(ring_df.iterrows()):
         orig_idx = row["index"]
+
+        if balance and i == split_at and day_idx == 0:
+            day_idx = 1
+            cursor = day_start_min
+
         placed = False
         while day_idx < len(EVENT_DAYS):
             if cursor < lunch_end_min and cursor + slot_minutes > lunch_start_min:
@@ -428,6 +485,73 @@ def move_division_to_ring(schedule, division, source_ring, dest_ring, position="
     return schedule
 
 
+def add_athlete(schedule, athlete, school, division, ring=None, event_category=None):
+    """
+    Add a new athlete to the schedule, placed at the end of the matching
+    division block on the appropriate ring. Times are recomputed for that
+    ring after insertion.
+
+    If `ring` is None, the ring is inferred from any existing entries in
+    the same division. If the division does not exist yet, the ring must
+    be provided. The new athlete is inserted immediately after the last
+    existing athlete in that division (so they sit at the end of the
+    division's block, before the next division starts).
+    """
+    schedule = schedule.copy()
+
+    # Locate existing rows in this division.
+    div_rows = schedule[schedule["division"] == division]
+
+    if ring is None:
+        if div_rows.empty:
+            raise ValueError(
+                f"Division {division!r} not found in schedule. "
+                "You must specify ring= when adding an athlete to a brand-new division."
+            )
+        # All entries in a division should be on the same ring; pick the most common.
+        ring = div_rows["ring"].mode().iloc[0]
+
+    if event_category is None:
+        if not div_rows.empty:
+            event_category = div_rows["event_category"].mode().iloc[0]
+        else:
+            event_category = "Manual Entry"
+
+    new_entry_id = int(schedule["entry_id"].max()) + 1 if len(schedule) else 0
+
+    # Find the position to insert (just after the last existing athlete in this division on this ring).
+    on_ring = schedule[schedule["ring"] == ring].sort_values("order_in_ring")
+    if not on_ring.empty:
+        match = on_ring[on_ring["division"] == division]
+        if not match.empty:
+            insert_after_order = int(match["order_in_ring"].max())
+        else:
+            # Brand-new division on this ring — append after everything.
+            insert_after_order = int(on_ring["order_in_ring"].max())
+    else:
+        insert_after_order = -1
+
+    # Bump order_in_ring for every entry on this ring that comes after the insert point.
+    bump_mask = (schedule["ring"] == ring) & (schedule["order_in_ring"] > insert_after_order)
+    schedule.loc[bump_mask, "order_in_ring"] = schedule.loc[bump_mask, "order_in_ring"] + 1
+
+    new_row = {
+        "entry_id": new_entry_id,
+        "athlete": athlete.strip(),
+        "school": (school or "").strip(),
+        "dob": "",
+        "event_category": event_category,
+        "division": division,
+        "ring": ring,
+        "order_in_ring": insert_after_order + 1,
+        "day": "Saturday",        # placeholder, renumber_ring will overwrite
+        "start_time": "--:--",
+        "end_time": "--:--",
+    }
+    schedule = pd.concat([schedule, pd.DataFrame([new_row])], ignore_index=True)
+    return renumber_ring(schedule, ring)
+
+
 def detect_conflicts(schedule):
     """Find athletes scheduled at overlapping times in different rings."""
     valid = schedule[schedule["day"].isin(EVENT_DAYS)].copy()
@@ -470,3 +594,35 @@ def schedule_to_dict(schedule):
 def schedule_from_dict(records):
     """Deserialize from JSON."""
     return pd.DataFrame(records)
+
+
+def division_colors(divisions_in_order):
+    """
+    Assign a light pastel hex color to each division so adjacent divisions are
+    always visually distinct. Cycles through a palette of distinct light hues
+    (green / blue / red / yellow / purple / orange / teal / pink), shifting
+    by 3 positions on each rotation so even consecutive cycles look different.
+    All colors are light enough that black text reads well.
+    """
+    n = len(divisions_in_order)
+    if n == 0:
+        return {}
+
+    palette = [
+        "#C8F0C8",  # light green
+        "#C8DCF5",  # light blue
+        "#F5CDCD",  # light red / pink
+        "#FFF1B8",  # light yellow
+        "#E0CDF0",  # light purple
+        "#FFD9B8",  # light orange
+        "#C8EFE8",  # light teal
+        "#F4C8DC",  # light rose
+    ]
+
+    out = {}
+    for i, div in enumerate(divisions_in_order):
+        # Walk by 3 each step so adjacent indices land far apart in the palette
+        # while still cycling through every color before repeating.
+        idx = (i * 3) % len(palette)
+        out[div] = palette[idx]
+    return out

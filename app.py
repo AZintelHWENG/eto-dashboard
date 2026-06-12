@@ -17,7 +17,7 @@ CSV_PATH = APP_DIR / "registrations.csv"
 STATE_PATH = APP_DIR / "schedule_state.json"
 
 st.set_page_config(
-    page_title="6th Annual Phoenix Wushu Nationals - Schedule",
+    page_title="Terry's Event Schedule",
     page_icon="🥋",
     layout="wide",
 )
@@ -49,8 +49,400 @@ def rebuild_schedule():
 if "schedule" not in st.session_state:
     st.session_state.schedule = load_or_build_schedule()
 
+# Ensure the schedule carries a "score" column. Old saved JSONs predate
+# this column, so seed it as an empty string here so the rest of the app
+# can read/write it freely.
+if "score" not in st.session_state.schedule.columns:
+    st.session_state.schedule["score"] = ""
+else:
+    st.session_state.schedule["score"] = st.session_state.schedule["score"].fillna("")
+
+
+# Promote any pending widget values that were staged on a previous run
+# (e.g. by a "Jump" or "Next match" button). Writing directly to a
+# widget-bound session_state key after the widget is instantiated raises
+# StreamlitAPIException, so we stage values into pending_* keys and
+# promote them here, before any widget binds to the real keys.
+for src, dst in [
+    ("pending_view_rings", "view_rings"),
+    ("pending_view_day", "view_day"),
+    ("pending_ath_ring", "ath_ring"),
+    ("pending_div_ring", "div_ring"),
+]:
+    if src in st.session_state:
+        st.session_state[dst] = st.session_state.pop(src)
 
 schedule = st.session_state.schedule
+
+
+# ----- Ring button styling -----
+RING_ICONS = {
+    "Sanda Ring": "🥊",
+    "Open Mat": "✊",
+    "Lion Dance Stage": "🐉",
+    "Ring 1": "🔴",
+    "Ring 2": "🟠",
+    "Ring 3": "🟡",
+    "Ring 4": "🟢",
+    "Ring 5": "🔵",
+}
+
+# Border color for the numbered rings (CSS hex). Fixed rings have no border tint.
+RING_BORDER_COLORS = {
+    "Ring 1": "#E74C3C",   # red
+    "Ring 2": "#E67E22",   # orange
+    "Ring 3": "#F1C40F",   # yellow
+    "Ring 4": "#27AE60",   # green
+    "Ring 5": "#3498DB",   # blue
+}
+
+
+def _inject_ring_button_styles():
+    """One-time injection of CSS that styles ring buttons via Streamlit's
+    `st-key-<key>` class. Streamlit ≥ 1.36 emits a class like `st-key-foo`
+    on the wrapping container of any widget given key=`foo`."""
+    if st.session_state.get("_ring_button_css_done"):
+        return
+    css_rules = [
+        # Every ring button gets a thicker border + rounded corners.
+        '[class*="st-key-ringbtn-"] button {'
+        '  border-width: 3px !important;'
+        '  border-radius: 14px !important;'
+        '  font-weight: 600 !important;'
+        '  padding: 0.5rem 0.4rem !important;'
+        '  min-height: 3.2rem !important;'
+        '}',
+    ]
+    for ring, color in RING_BORDER_COLORS.items():
+        slug = ring.replace(" ", "_")
+        css_rules.append(
+            f'[class*="st-key-ringbtn-{slug}"] button {{'
+            f'  border-color: {color} !important;'
+            f'}}'
+        )
+        css_rules.append(
+            f'[class*="st-key-ringbtn-{slug}"] button:hover {{'
+            f'  background-color: {color}22 !important;'
+            f'  border-color: {color} !important;'
+            f'  color: inherit !important;'
+            f'}}'
+        )
+    st.markdown(f"<style>\n{chr(10).join(css_rules)}\n</style>", unsafe_allow_html=True)
+    st.session_state._ring_button_css_done = True
+
+
+def _label_for_ring(ring):
+    icon = RING_ICONS.get(ring, "")
+    return f"{icon}  {ring}".strip()
+
+
+def ring_jump_buttons(state_key, prefix):
+    """Render a row of one button per ring with icons + colored borders for Ring 1-5."""
+    _inject_ring_button_styles()
+    cols = st.columns(len(sb.ALL_RINGS))
+    for col, ring in zip(cols, sb.ALL_RINGS):
+        with col:
+            slug = ring.replace(" ", "_")
+            btn_key = f"ringbtn-{slug}-{prefix}"
+            if st.button(_label_for_ring(ring), key=btn_key, width="stretch"):
+                st.session_state[state_key] = ring
+                st.rerun()
+
+
+def _clock_face_svg(time_str, label, ring_color="#444"):
+    """Render an analog clock SVG for the given HH:MM time. label appears below."""
+    if not time_str or time_str == "--:--":
+        hour, minute = 0, 0
+        display = "—"
+    else:
+        try:
+            hh, mm = time_str.split(":")
+            hour = int(hh) % 12
+            minute = int(mm)
+            display = time_str
+        except (ValueError, AttributeError):
+            hour, minute = 0, 0
+            display = time_str
+
+    # Compute hand angles (12 o'clock = top, clockwise).
+    minute_angle = (minute / 60.0) * 360
+    hour_angle = ((hour + minute / 60.0) / 12.0) * 360
+
+    import math
+    cx, cy, r = 50, 50, 42
+    def hand_xy(angle_deg, length):
+        rad = math.radians(angle_deg - 90)
+        return cx + length * math.cos(rad), cy + length * math.sin(rad)
+
+    mx, my = hand_xy(minute_angle, 32)
+    hx, hy = hand_xy(hour_angle, 22)
+
+    ticks_svg = ""
+    for i in range(12):
+        rad = math.radians(i * 30 - 90)
+        x1 = cx + (r - 3) * math.cos(rad)
+        y1 = cy + (r - 3) * math.sin(rad)
+        x2 = cx + r * math.cos(rad)
+        y2 = cy + r * math.sin(rad)
+        ticks_svg += f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="#666" stroke-width="1.5"/>'
+
+    svg = f'''
+    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;">
+      <svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="{cx}" cy="{cy}" r="{r}" fill="#fafafa" stroke="{ring_color}" stroke-width="3"/>
+        {ticks_svg}
+        <line x1="{cx}" y1="{cy}" x2="{hx:.1f}" y2="{hy:.1f}" stroke="#222" stroke-width="3.5" stroke-linecap="round"/>
+        <line x1="{cx}" y1="{cy}" x2="{mx:.1f}" y2="{my:.1f}" stroke="#222" stroke-width="2.2" stroke-linecap="round"/>
+        <circle cx="{cx}" cy="{cy}" r="2.5" fill="#222"/>
+      </svg>
+      <div style="font-size:14px;font-weight:700;color:#222;">{display}</div>
+      <div style="font-size:11px;color:#555;text-align:center;line-height:1.2;">{label}</div>
+    </div>
+    '''
+    return svg
+
+
+def _hhmm_to_min(t):
+    try:
+        h, m = str(t).split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _min_to_hhmm(m):
+    return f"{int(m // 60) % 24:02d}:{int(m % 60):02d}"
+
+
+def _live_eta_for_ring(ring, day, schedule):
+    """
+    Live ETA for a ring on a given day, projected from the simulator state.
+
+    Returns (eta_str, drift_min, scheduled_end_str). drift_min is positive when
+    we're projecting LATER than the schedule. None for drift means no comparison.
+    Falls back to scheduled end_time when the sim is idle or this day isn't
+    the live day.
+    """
+    ring_rows = schedule[(schedule["ring"] == ring) & (schedule["day"] == day)]
+    if ring_rows.empty:
+        return ("--:--", None, "--:--")
+    sched_end = ring_rows["end_time"].max()
+    sched_end_min = _hhmm_to_min(sched_end)
+
+    # If sim isn't running and never started, just return the static schedule end.
+    sim_state = st.session_state.get("sim_ring_state") or {}
+    sim_wall_start = st.session_state.get("sim_wall_start")
+    if sim_wall_start is None or ring not in sim_state:
+        return (sched_end, None, sched_end)
+
+    # Determine the live simulated minute-of-day and which day we're on.
+    import time as _time
+    sim_running = st.session_state.get("sim_running", False)
+    sim_speed = st.session_state.get("sim_speed", 1)
+    paused_offset = st.session_state.get("sim_paused_offset", 0)
+    if sim_running:
+        elapsed_real = _time.time() - sim_wall_start
+        sim_seconds = paused_offset + elapsed_real * sim_speed
+    else:
+        sim_seconds = paused_offset
+    total_min = sim_seconds / 60.0
+    SIM_BASE = 9 * 60
+    if total_min < 24 * 60:
+        sim_day = "Saturday"
+        sim_now_min = SIM_BASE + total_min
+    else:
+        sim_day = "Sunday"
+        sim_now_min = SIM_BASE + (total_min - 24 * 60)
+
+    # The sim only affects ETAs for its current day. Future days keep the
+    # static end_time; past days are already in the books.
+    if day != sim_day:
+        return (sched_end, None, sched_end)
+
+    rs = sim_state[ring]
+    cur_idx = rs.get("current_idx", 0)
+    started_at = rs.get("current_started_min")
+    pending = rs.get("pending_score")
+    queue = ring_rows.sort_values("order_in_ring").reset_index(drop=True)
+    if cur_idx >= len(queue):
+        return (_min_to_hhmm(sim_now_min), None, sched_end)  # ring is done
+
+    ring_slot = sb.slot_for_ring(ring)
+    remaining_after_current = max(0, len(queue) - cur_idx - 1)
+
+    if pending is not None:
+        # Athlete just finished, awaiting score → next athlete starts ~now.
+        projected_end_of_current = max(int(sim_now_min), int(pending["finished_min"]))
+    elif started_at is not None and started_at <= sim_now_min:
+        # Currently in progress → ends at started_at + ring_slot (capped).
+        projected_end_of_current = started_at + ring_slot
+    else:
+        # Idle or hasn't started yet → next athlete starts at max(now, sched_start).
+        sched_start = _hhmm_to_min(queue.iloc[cur_idx]["start_time"]) or int(sim_now_min)
+        projected_end_of_current = max(int(sim_now_min), sched_start) + ring_slot
+
+    eta_min = projected_end_of_current + remaining_after_current * ring_slot
+    drift = (eta_min - sched_end_min) if sched_end_min is not None else None
+    return (_min_to_hhmm(eta_min), drift, sched_end)
+
+
+def _projected_times_for_sim_day(schedule):
+    """
+    Walk each ring's queue once and project actual + projected times for every
+    athlete on the live day. Returns {entry_id: (proj_start_min, proj_end_min, marker)}.
+    Returns {} when the simulator hasn't started.
+
+    Cursor rules: when the prior athlete's finish time is < this athlete's
+    scheduled start by MORE than one ring_slot, that's a structural gap (lunch
+    break) — fall back to the scheduled start. Otherwise the cursor wins,
+    which is how early finishes / absences pull every downstream athlete earlier.
+    """
+    sim_state = st.session_state.get("sim_ring_state") or {}
+    sim_wall_start = st.session_state.get("sim_wall_start")
+    if sim_wall_start is None or not sim_state:
+        return {}
+
+    import time as _time
+    sim_running = st.session_state.get("sim_running", False)
+    sim_speed = st.session_state.get("sim_speed", 1)
+    paused_offset = st.session_state.get("sim_paused_offset", 0)
+    if sim_running:
+        elapsed_real = _time.time() - sim_wall_start
+        sim_seconds = paused_offset + elapsed_real * sim_speed
+    else:
+        sim_seconds = paused_offset
+    total_min = sim_seconds / 60.0
+    SIM_BASE = 9 * 60
+    if total_min < 24 * 60:
+        sim_day = "Saturday"
+        sim_now_min = SIM_BASE + total_min
+    else:
+        sim_day = "Sunday"
+        sim_now_min = SIM_BASE + (total_min - 24 * 60)
+    sim_now_min = int(sim_now_min)
+
+    overrides = {}
+
+    for ring in sb.ALL_RINGS:
+        if ring not in sim_state:
+            continue
+        rs = sim_state[ring]
+        ring_slot = sb.slot_for_ring(ring)
+        log_by_eid = {e["entry_id"]: e for e in rs.get("log", [])}
+        pending = rs.get("pending_score")
+        started_at = rs.get("current_started_min")
+        cur_idx = rs.get("current_idx", 0)
+
+        ring_rows = (
+            schedule[(schedule["ring"] == ring) & (schedule["day"] == sim_day)]
+            .sort_values("order_in_ring")
+            .reset_index(drop=True)
+        )
+
+        cursor = None  # last "ring is free again" minute
+        for i in range(len(ring_rows)):
+            row = ring_rows.iloc[i]
+            eid = int(row["entry_id"])
+            sched_start = _hhmm_to_min(row["start_time"])
+
+            # Bridge real structural gaps (lunch is 60 min). Anything below
+            # this threshold is just accumulated drift from absences/early
+            # finishes and SHOULD propagate forward — that's the whole point
+            # of the live projection.
+            LUNCH_GAP_MIN = 30
+            if cursor is not None and sched_start is not None and sched_start - cursor >= LUNCH_GAP_MIN:
+                cursor = sched_start
+
+            if eid in log_by_eid:
+                # Already logged — use the recorded times.
+                entry = log_by_eid[eid]
+                if entry["status"] == "absent":
+                    overrides[eid] = (None, None, "❌")
+                    # Cursor jumps to whenever the user marked them absent.
+                    if cursor is None or entry["finished_min"] > cursor:
+                        cursor = entry["finished_min"]
+                else:
+                    overrides[eid] = (entry["started_min"], entry["finished_min"], "✅")
+                    cursor = entry["finished_min"]
+            elif pending is not None and pending["entry_id"] == eid:
+                # Just finished, awaiting score entry.
+                overrides[eid] = (pending["started_min"], pending["finished_min"], "📝")
+                cursor = max(sim_now_min, int(pending["finished_min"]))
+            elif i == cur_idx:
+                # Currently active athlete (in progress or ready).
+                if started_at is not None and started_at <= sim_now_min:
+                    overrides[eid] = (started_at, started_at + ring_slot, "🟢")
+                    cursor = started_at + ring_slot
+                else:
+                    base = cursor if cursor is not None else sim_now_min
+                    proj_start = max(base, sim_now_min)
+                    overrides[eid] = (proj_start, proj_start + ring_slot, "⏳")
+                    cursor = proj_start + ring_slot
+            else:
+                # Future athlete — cursor wins, which propagates early/late drift.
+                base = cursor if cursor is not None else (sched_start or sim_now_min)
+                proj_start = base
+                overrides[eid] = (proj_start, proj_start + ring_slot, "")
+                cursor = proj_start + ring_slot
+
+    return overrides
+
+
+def apply_sim_time_overrides(view_df, schedule):
+    """Return a copy of view_df with start_time/end_time replaced by the
+    sim's actual or projected values, plus a status marker prefix."""
+    overrides = _projected_times_for_sim_day(schedule)
+    if not overrides:
+        return view_df
+    out = view_df.copy()
+    for eid, (sm, em, marker) in overrides.items():
+        mask = out["entry_id"] == eid
+        if not mask.any():
+            continue
+        if sm is None:  # absent
+            out.loc[mask, "start_time"] = f"{marker} —" if marker else "—"
+            out.loc[mask, "end_time"] = "—"
+        else:
+            start_str = _min_to_hhmm(sm)
+            end_str = _min_to_hhmm(em)
+            out.loc[mask, "start_time"] = f"{marker} {start_str}".strip() if marker else start_str
+            out.loc[mask, "end_time"] = end_str
+    return out
+
+
+def render_end_time_clocks(schedule):
+    """Show one analog clock per ring × day pair displaying a live ETA when the
+    sim is active, or the static end_time otherwise. Drift vs. the scheduled
+    end_time is shown beneath the clock when the sim is live for that day."""
+    for day in sb.EVENT_DAYS:
+        st.markdown(f"#### 🗓️ {day}")
+        cols = st.columns(len(sb.ALL_RINGS))
+        for col, ring in zip(cols, sb.ALL_RINGS):
+            eta_str, drift, sched_end = _live_eta_for_ring(ring, day, schedule)
+            ring_color = RING_BORDER_COLORS.get(ring, "#666")
+            icon = RING_ICONS.get(ring, "")
+            label = f"{icon} {ring}"
+            with col:
+                st.markdown(_clock_face_svg(eta_str, label, ring_color=ring_color), unsafe_allow_html=True)
+                if drift is None:
+                    st.markdown(
+                        f'<div style="text-align:center;font-size:10px;color:#888;margin-top:-4px;">'
+                        f'sched {sched_end}</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    if drift > 0:
+                        color, sign = "#c0392b", "+"
+                    elif drift < 0:
+                        color, sign = "#27ae60", ""
+                    else:
+                        color, sign = "#7f8c8d", ""
+                    st.markdown(
+                        f'<div style="text-align:center;font-size:10px;color:#888;margin-top:-4px;">'
+                        f'sched {sched_end} • <span style="color:{color};font-weight:600;">'
+                        f'{sign}{drift}m {"late" if drift > 0 else ("ahead" if drift < 0 else "on time")}</span></div>',
+                        unsafe_allow_html=True,
+                    )
 
 with st.sidebar:
     st.markdown("# 🥋 PWN 2026")
@@ -85,48 +477,137 @@ with st.sidebar:
         mime="text/csv",
     )
 
-st.title("🥋 Run schedule")
+st.title("🥋 Terry's Event Schedule")
 st.caption("Interactive Schedule Dashboard | 8 Rings × 2 Days")
 
-tab_view, tab_athletes, tab_divisions, tab_move, tab_conflicts = st.tabs(
-    ["📋 Schedule View", "👤 Edit Athletes", "🏷️ Edit Divisions", "🔀 Move Division to Another Ring", "⚠️ Conflicts"]
+tab_view, tab_athletes, tab_divisions, tab_move, tab_add, tab_search, tab_sim, tab_conflicts = st.tabs(
+    ["📋 Schedule View", "👤 Edit Athletes", "🏷️ Edit Divisions",
+     "🔀 Move Division to Another Ring", "➕ Add Athlete", "🔍 Search Athlete",
+     "🎬 Simulate", "⚠️ Conflicts"]
 )
 
 with tab_view:
     st.subheader("Master Schedule")
+
+    with st.expander("⏰ Estimated end times by ring (click to expand/collapse)", expanded=True):
+        # Live-tick the ETA panel only while the simulator is running, so the
+        # rest of the Schedule View stays interactive (no widget greyouts).
+        eta_tick = "1s" if st.session_state.get("sim_running") else None
+
+        @st.fragment(run_every=eta_tick)
+        def _eta_panel():
+            sim_running_now = st.session_state.get("sim_running", False)
+            sim_started = st.session_state.get("sim_wall_start") is not None
+            if sim_running_now:
+                st.caption("🟢 Live ETA — projected from current pace; updates every second.")
+            elif sim_started:
+                st.caption("🟡 Simulator paused — ETA frozen at last sim minute.")
+            else:
+                st.caption("⚪ Simulator idle — showing static scheduled end times. Start the sim on the 🎬 Simulate tab to see live ETA.")
+            render_end_time_clocks(schedule)
+
+        _eta_panel()
+    st.divider()
+
+    st.markdown("**Jump to ring:**")
+    _inject_ring_button_styles()
+    btn_cols = st.columns(len(sb.ALL_RINGS) + 1)
+    for col, ring in zip(btn_cols[:-1], sb.ALL_RINGS):
+        with col:
+            slug = ring.replace(" ", "_")
+            if st.button(_label_for_ring(ring), key=f"ringbtn-{slug}-view", width="stretch"):
+                st.session_state.view_rings = [ring]
+                st.rerun()
+    with btn_cols[-1]:
+        if st.button("⭐ All rings", key="ringbtn-all-view", width="stretch"):
+            st.session_state.view_rings = list(sb.ALL_RINGS)
+            st.rerun()
 
     col1, col2 = st.columns([1, 3])
     with col1:
         day_filter = st.selectbox("Day", ["Both", "Saturday", "Sunday"], key="view_day")
     with col2:
         ring_filter = st.multiselect(
-            "Rings",
+            "Rings (or pick from dropdown)",
             sb.ALL_RINGS,
             default=sb.ALL_RINGS,
             key="view_rings",
         )
 
-    view_df = schedule.copy()
-    if day_filter != "Both":
-        view_df = view_df[view_df["day"] == day_filter]
-    if ring_filter:
-        view_df = view_df[view_df["ring"].isin(ring_filter)]
+    color_map = {}
+    for ring in sb.ALL_RINGS:
+        ring_view = schedule[schedule["ring"] == ring].sort_values("order_in_ring")
+        divs_in_order = []
+        seen = set()
+        for d in ring_view["division"]:
+            if d not in seen:
+                divs_in_order.append(d)
+                seen.add(d)
+        ring_colors = sb.division_colors(divs_in_order)
+        for div, color in ring_colors.items():
+            color_map[(ring, div)] = color
 
-    view_df = view_df.sort_values(["day", "ring", "order_in_ring"]).reset_index(drop=True)
+    highlight_eid = st.session_state.get("highlight_entry_id")
 
-    display_cols = ["day", "ring", "start_time", "end_time", "athlete", "school", "event_category", "division"]
-    display_df = view_df[display_cols].rename(columns={
-        "day": "Day",
-        "ring": "Ring",
-        "start_time": "Start",
-        "end_time": "End",
-        "athlete": "Athlete",
-        "school": "School",
-        "event_category": "Event",
-        "division": "Division",
-    })
+    # Tick the schedule grid every second whenever the sim has ANY state
+    # (running OR paused with prior state). The sim's Complete/Absent buttons
+    # use scope="fragment" to stay snappy on their own tab, so the grid needs
+    # its own tick to pick up state changes (absences pulling downstream
+    # athletes earlier, etc.).
+    grid_tick = "1s" if st.session_state.get("sim_wall_start") is not None else None
 
-    st.dataframe(display_df, width="stretch", hide_index=True, height=600)
+    @st.fragment(run_every=grid_tick)
+    def _schedule_grid():
+        live_df = schedule.copy()
+        # Apply sim-driven time overrides BEFORE filtering so that any row
+        # the user is viewing reflects the current/projected state.
+        live_df = apply_sim_time_overrides(live_df, schedule)
+
+        view_df = live_df
+        if day_filter != "Both":
+            view_df = view_df[view_df["day"] == day_filter]
+        if ring_filter:
+            view_df = view_df[view_df["ring"].isin(ring_filter)]
+        view_df = view_df.sort_values(["day", "ring", "order_in_ring"]).reset_index(drop=True)
+
+        if highlight_eid is not None:
+            match_rows = view_df[view_df["entry_id"] == highlight_eid]
+            if not match_rows.empty:
+                r = match_rows.iloc[0]
+                st.info(f"🎯 Highlighting **{r['athlete']}** on **{r['ring']}** ({r['day']} {r['start_time']}-{r['end_time']}).")
+                if st.button("Clear highlight", key="clear_hl"):
+                    st.session_state.highlight_entry_id = None
+                    st.rerun()
+
+        display_cols = ["entry_id", "day", "ring", "start_time", "end_time", "athlete", "school", "event_category", "division", "score"]
+        if "score" not in view_df.columns:
+            view_df = view_df.assign(score="")
+        display_df = view_df[display_cols].rename(columns={
+            "entry_id": "_eid",
+            "day": "Day",
+            "ring": "Ring",
+            "start_time": "Start",
+            "end_time": "End",
+            "athlete": "Athlete",
+            "school": "School",
+            "event_category": "Event",
+            "division": "Division",
+            "score": "Score",
+        })
+
+        def _row_style(row):
+            color = color_map.get((row["Ring"], row["Division"]), "#FFFFFF")
+            base = f"background-color: {color}; color: #000000"
+            if highlight_eid is not None and row["_eid"] == highlight_eid:
+                base += "; outline: 3px solid #D81B60; outline-offset: -3px; font-weight: 700"
+            return [base] * len(row)
+
+        styled = display_df.style.apply(_row_style, axis=1).hide(["_eid"], axis=1)
+        if st.session_state.get("sim_wall_start") is not None:
+            st.caption("Time slots reflect the live simulator: ✅ done • 🟢 in progress • 📝 awaiting score • ⏳ ready • ❌ absent. Future rows reproject when athletes finish early or are marked absent.")
+        st.dataframe(styled, width="stretch", hide_index=True, height=600)
+
+    _schedule_grid()
 
     st.markdown("### Ring Capacity")
     capacity = (
@@ -138,7 +619,134 @@ with tab_athletes:
     st.subheader("Reorder Individual Athletes")
     st.caption("Drag athletes up or down to reorder. Click **Apply Reorder** to commit changes (times auto-recalculate).")
 
-    ring_pick = st.selectbox("Ring", sb.ALL_RINGS, key="ath_ring")
+    # ----- Athlete search + cycle -----
+    st.markdown("**🔍 Find an athlete and jump to their position:**")
+    sc1, sc2, sc3 = st.columns([4, 1.5, 1.5])
+    with sc1:
+        ath_search = st.text_input(
+            "Athlete name (partial match)",
+            key="ath_search",
+            placeholder="Type a name and press Enter",
+            label_visibility="collapsed",
+        )
+    with sc2:
+        find_clicked = st.button("🔍 Find", key="ath_find_btn", width="stretch")
+    with sc3:
+        next_clicked = st.button(
+            "⏭️ Next match (Space)",
+            key="ath_next_btn",
+            width="stretch",
+            help="Tab to focus this button, then press Space to cycle to the next match.",
+        )
+
+    # Compute matches whenever the query is non-empty.
+    matches_df = pd.DataFrame()
+    if ath_search and ath_search.strip():
+        q = ath_search.strip().lower()
+        matches_df = schedule[schedule["athlete"].astype(str).str.lower().str.contains(q, na=False)].copy()
+        # 1-based position within each ring + ring size, so the user sees
+        # "Position 47 / 198" etc. without scrolling anywhere.
+        ring_size_map = schedule.groupby("ring").size().to_dict()
+        positions = []
+        for _, m in matches_df.iterrows():
+            ring_queue = (
+                schedule[schedule["ring"] == m["ring"]]
+                .sort_values("order_in_ring")
+                .reset_index(drop=True)
+            )
+            pos = ring_queue.index[ring_queue["entry_id"] == m["entry_id"]].tolist()
+            positions.append(pos[0] + 1 if pos else None)
+        matches_df["position_in_ring"] = positions
+        matches_df["ring_size"] = matches_df["ring"].map(ring_size_map)
+        matches_df = matches_df.sort_values(["ring", "order_in_ring"]).reset_index(drop=True)
+
+    # Reset the cycle index when the query changes.
+    if st.session_state.get("ath_search_last") != ath_search:
+        st.session_state.ath_search_last = ath_search
+        st.session_state.ath_match_idx = 0
+
+    # On Find or Next, advance/reset the index and stage the ring change.
+    if (find_clicked or next_clicked) and not matches_df.empty:
+        if next_clicked:
+            st.session_state.ath_match_idx = (st.session_state.get("ath_match_idx", 0) + 1) % len(matches_df)
+        else:
+            st.session_state.ath_match_idx = 0
+
+        target = matches_df.iloc[st.session_state.ath_match_idx]
+        st.session_state.highlight_athlete_eid = int(target["entry_id"])
+
+        if st.session_state.get("ath_ring") != target["ring"]:
+            st.session_state.pending_ath_ring = target["ring"]
+            st.rerun()
+
+    if (find_clicked or next_clicked) and matches_df.empty and ath_search and ath_search.strip():
+        st.warning(f"No athletes matching '{ath_search}'.")
+
+    # ----- Persistent results panel: ring + position for every match -----
+    if not matches_df.empty:
+        cur_idx = st.session_state.get("ath_match_idx", 0) % len(matches_df)
+        cur = matches_df.iloc[cur_idx]
+        st.success(
+            f"Found **{len(matches_df)} entry/entries** matching '{ath_search}'. "
+            f"Currently focused on match **{cur_idx + 1} of {len(matches_df)}** — "
+            f"**{cur['athlete']}** at **{cur['ring']}** position **{cur['position_in_ring']} of {cur['ring_size']}** "
+            f"({cur['day']} {cur['start_time']}–{cur['end_time']})."
+        )
+
+        st.markdown("**All matches** — click **Show** to focus that entry, or press Space to cycle.")
+        # Header
+        hcols = st.columns([0.5, 2.2, 1.6, 1.8, 1.6, 3, 1.2])
+        for c, h in zip(hcols, ["", "Athlete", "Ring", "Position", "Day / Time", "Division", ""]):
+            c.markdown(f"**{h}**")
+
+        for i, m in matches_df.iterrows():
+            cur_marker = "🎯" if i == cur_idx else ""
+            cols = st.columns([0.5, 2.2, 1.6, 1.8, 1.6, 3, 1.2])
+            cols[0].markdown(f"**{cur_marker}**")
+            cols[1].markdown(f"**{m['athlete']}**")
+            cols[2].markdown(f"📍 {m['ring']}")
+            cols[3].markdown(f"**{m['position_in_ring']} / {m['ring_size']}**")
+            cols[4].markdown(f"{m['day']} {m['start_time']}")
+            cols[5].caption(m["division"])
+            with cols[6]:
+                if st.button("Show", key=f"show_match_{int(m['entry_id'])}", width="stretch"):
+                    st.session_state.ath_match_idx = i
+                    st.session_state.highlight_athlete_eid = int(m["entry_id"])
+                    if st.session_state.get("ath_ring") != m["ring"]:
+                        st.session_state.pending_ath_ring = m["ring"]
+                    st.rerun()
+
+    # Global Space-key listener that clicks the Next match button.
+    if not matches_df.empty and len(matches_df) > 1:
+        space_js = """
+        <script>
+        (function() {
+            const win = window.parent;
+            const doc = win.document;
+            if (win.__pwnSpaceHandlerInstalled) return;
+            win.__pwnSpaceHandlerInstalled = true;
+            doc.addEventListener("keydown", (e) => {
+                if (e.code !== "Space" && e.key !== " ") return;
+                const tag = (e.target && e.target.tagName) || "";
+                if (tag === "INPUT" || tag === "TEXTAREA" || (e.target && e.target.isContentEditable)) return;
+                const buttons = doc.querySelectorAll('button');
+                for (const b of buttons) {
+                    if (b.innerText && b.innerText.includes("Next match")) {
+                        e.preventDefault();
+                        b.click();
+                        return;
+                    }
+                }
+            }, true);
+        })();
+        </script>
+        """
+        st.components.v1.html(space_js, height=0)
+
+    st.markdown("**Jump to ring:**")
+    ring_jump_buttons("ath_ring", "ath_jump")
+
+    ring_pick = st.selectbox("Ring (or pick from dropdown)", sb.ALL_RINGS, key="ath_ring")
 
     ring_df = schedule[schedule["ring"] == ring_pick].sort_values("order_in_ring").reset_index(drop=True)
 
@@ -148,22 +756,89 @@ with tab_athletes:
         st.markdown(f"**{len(ring_df)} athletes on {ring_pick}** (across both days)")
 
         # Encode each athlete as "entry_id|label" so we can parse the drag result back to entry_ids.
-        items = []
+        all_items = []
         eid_to_label = {}
-        for _, row in ring_df.iterrows():
+        eid_to_pos = {}  # entry_id -> 0-based index in ring_df
+        for idx, (_, row) in enumerate(ring_df.iterrows()):
             eid = int(row["entry_id"])
             day_short = "Sat" if row["day"] == "Saturday" else ("Sun" if row["day"] == "Sunday" else "OVR")
             label = f"[{day_short} {row['start_time']}] {row['athlete']} — {row['division']}"
             tagged = f"{eid}|{label}"
-            items.append(tagged)
+            all_items.append(tagged)
             eid_to_label[eid] = tagged
+            eid_to_pos[eid] = idx
 
-        sortable_key = f"sortable_{ring_pick}"
-        new_order = sort_items(items, direction="vertical", key=sortable_key)
+        # Window mode: when an athlete is highlighted on this ring, show
+        # only ±10 rows around them so they're visible without scrolling.
+        # Drag-and-drop is disabled in window mode (would mis-order the full
+        # ring); user clears the search to drag.
+        hl_eid_local = st.session_state.get("highlight_athlete_eid")
+        window_mode = (
+            hl_eid_local is not None
+            and any(int(row["entry_id"]) == hl_eid_local for _, row in ring_df.iterrows())
+        )
+
+        if window_mode:
+            center = eid_to_pos[hl_eid_local]
+            start = max(0, center - 10)
+            end = min(len(all_items), center + 11)
+            items = all_items[start:end]
+            window_offset = start
+            st.warning(
+                f"🎯 Showing rows **{start + 1}–{end}** of {len(all_items)} on **{ring_pick}** "
+                f"(centered on the highlighted athlete). "
+                f"Drag-and-drop is disabled in this view — clear the search at the top to re-enable."
+            )
+        else:
+            items = all_items
+            window_offset = 0
+
+        # Build per-item background colors so each division block looks
+        # different and adjacent divisions are visually distinct. Athletes
+        # in the same division share a color (so a block is one solid hue).
+        ring_divs_in_order = []
+        seen_divs = set()
+        for d in ring_df["division"]:
+            if d not in seen_divs:
+                ring_divs_in_order.append(d)
+                seen_divs.add(d)
+        div_color_map = sb.division_colors(ring_divs_in_order)
+
+        # Build CSS: each visible row gets its division color, plus a thick
+        # magenta outline if it's the highlighted athlete. In window mode,
+        # nth-of-type indexes are 1..len(items) (the windowed slice).
+        item_css = []
+        for visible_idx, item in enumerate(items, start=1):
+            eid = int(item.split("|", 1)[0])
+            row = ring_df[ring_df["entry_id"] == eid].iloc[0]
+            color = div_color_map.get(row["division"], "#FFFFFF")
+            extra = ""
+            if hl_eid_local is not None and eid == hl_eid_local:
+                extra = "outline: 4px solid #D81B60 !important; outline-offset: -4px !important; font-weight: 800 !important;"
+            item_css.append(
+                f'.sortable-component .sortable-item:nth-of-type({visible_idx})'
+                f',.sortable-component .sortable-item:nth-of-type({visible_idx}):hover'
+                f' {{ background-color: {color} !important; color: #000000 !important; '
+                f'border: 1px solid #888 !important; {extra} }}'
+            )
+        custom_style = "\n".join(item_css)
+
+        # Use a different sortable key in window mode so Streamlit doesn't
+        # cache the long-list ordering when we switch to the short view.
+        suffix = f"_win{window_offset}" if window_mode else ""
+        sortable_key = f"sortable_{ring_pick}{suffix}"
+        new_order = sort_items(items, direction="vertical", key=sortable_key, custom_style=custom_style)
 
         col_a, col_b = st.columns([1, 5])
         with col_a:
-            if st.button("✅ Apply Reorder", key=f"apply_{ring_pick}", type="primary"):
+            apply_disabled = window_mode
+            if st.button(
+                "✅ Apply Reorder",
+                key=f"apply_{ring_pick}{suffix}",
+                type="primary",
+                disabled=apply_disabled,
+                help="Disabled while a search is active. Clear the search to reorder the full ring." if apply_disabled else None,
+            ):
                 new_eids = [int(s.split("|", 1)[0]) for s in new_order]
                 st.session_state.schedule = sb.reorder_ring(schedule, ring_pick, new_eids)
                 save_schedule(st.session_state.schedule)
@@ -176,7 +851,150 @@ with tab_divisions:
     st.subheader("Reorder Entire Divisions")
     st.caption("Drag whole divisions (blocks of athletes) up or down. Click **Apply Reorder** to commit.")
 
-    ring_pick_d = st.selectbox("Ring", sb.ALL_RINGS, key="div_ring")
+    # ----- Division search + cycle (across all rings) -----
+    st.markdown("**🔍 Find a division and jump to its position:**")
+    dsc1, dsc2, dsc3 = st.columns([4, 1.5, 1.5])
+    with dsc1:
+        div_search = st.text_input(
+            "Division name (partial match)",
+            key="div_search",
+            placeholder="e.g. C100A, Pudao, Taiji",
+            label_visibility="collapsed",
+        )
+    with dsc2:
+        div_find_clicked = st.button("🔍 Find", key="div_find_btn", width="stretch")
+    with dsc3:
+        div_next_clicked = st.button(
+            "⏭️ Next match (Space)",
+            key="div_next_btn",
+            width="stretch",
+            help="Tab to focus this button, then press Space to cycle to the next match.",
+        )
+
+    # Compute matches across all rings.
+    div_matches_df = pd.DataFrame()
+    if div_search and div_search.strip():
+        q = div_search.strip().lower()
+        # One row per (ring, division) pair.
+        unique_pairs = (
+            schedule[schedule["division"].astype(str).str.lower().str.contains(q, na=False)]
+            .groupby(["ring", "division"])
+            .agg(
+                size=("entry_id", "size"),
+                first_order=("order_in_ring", "min"),
+                first_day=("day", "first"),
+                first_start=("start_time", "first"),
+                last_end=("end_time", "last"),
+            )
+            .reset_index()
+        )
+
+        # Compute each division's 1-based position within its ring.
+        positions = []
+        ring_div_count = {}
+        for ring in unique_pairs["ring"].unique():
+            ring_view = schedule[schedule["ring"] == ring].sort_values("order_in_ring")
+            ordered_divs = []
+            seen = set()
+            for d in ring_view["division"]:
+                if d not in seen:
+                    ordered_divs.append(d)
+                    seen.add(d)
+            ring_div_count[ring] = len(ordered_divs)
+            for _, row in unique_pairs[unique_pairs["ring"] == ring].iterrows():
+                idx = ordered_divs.index(row["division"]) + 1 if row["division"] in ordered_divs else None
+                positions.append((row["ring"], row["division"], idx))
+        pos_lookup = {(r, d): p for r, d, p in positions}
+        unique_pairs["position_in_ring"] = unique_pairs.apply(
+            lambda r: pos_lookup.get((r["ring"], r["division"])), axis=1
+        )
+        unique_pairs["divs_in_ring"] = unique_pairs["ring"].map(ring_div_count)
+        div_matches_df = unique_pairs.sort_values(["ring", "first_order"]).reset_index(drop=True)
+
+    # Reset cycle index when the query changes.
+    if st.session_state.get("div_search_last") != div_search:
+        st.session_state.div_search_last = div_search
+        st.session_state.div_match_idx = 0
+
+    if (div_find_clicked or div_next_clicked) and not div_matches_df.empty:
+        if div_next_clicked:
+            st.session_state.div_match_idx = (st.session_state.get("div_match_idx", 0) + 1) % len(div_matches_df)
+        else:
+            st.session_state.div_match_idx = 0
+
+        target = div_matches_df.iloc[st.session_state.div_match_idx]
+        st.session_state.highlight_division = (target["ring"], target["division"])
+        if st.session_state.get("div_ring") != target["ring"]:
+            st.session_state.pending_div_ring = target["ring"]
+            st.rerun()
+
+    if (div_find_clicked or div_next_clicked) and div_matches_df.empty and div_search and div_search.strip():
+        st.warning(f"No divisions matching '{div_search}'.")
+
+    # Persistent results panel for divisions.
+    if not div_matches_df.empty:
+        cur_idx = st.session_state.get("div_match_idx", 0) % len(div_matches_df)
+        cur = div_matches_df.iloc[cur_idx]
+        st.success(
+            f"Found **{len(div_matches_df)} division(s)** matching '{div_search}'. "
+            f"Currently focused on match **{cur_idx + 1} of {len(div_matches_df)}** — "
+            f"**{cur['division']}** at **{cur['ring']}** position **{cur['position_in_ring']} of {cur['divs_in_ring']}** "
+            f"({cur['first_day']} starting {cur['first_start']}, {cur['size']} athletes)."
+        )
+
+        st.markdown("**All matches** — click **Show** to focus that division, or press Space to cycle.")
+        hcols = st.columns([0.5, 3, 1.6, 1.8, 1.6, 1, 1.2])
+        for c, h in zip(hcols, ["", "Division", "Ring", "Position", "Day / Time", "Athletes", ""]):
+            c.markdown(f"**{h}**")
+
+        for i, m in div_matches_df.iterrows():
+            cur_marker = "🎯" if i == cur_idx else ""
+            cols = st.columns([0.5, 3, 1.6, 1.8, 1.6, 1, 1.2])
+            cols[0].markdown(f"**{cur_marker}**")
+            cols[1].markdown(f"**{m['division']}**")
+            cols[2].markdown(f"📍 {m['ring']}")
+            cols[3].markdown(f"**{m['position_in_ring']} / {m['divs_in_ring']}**")
+            cols[4].markdown(f"{m['first_day']} {m['first_start']}")
+            cols[5].markdown(f"{m['size']}")
+            with cols[6]:
+                if st.button("Show", key=f"show_div_{m['ring']}_{m['division']}", width="stretch"):
+                    st.session_state.div_match_idx = i
+                    st.session_state.highlight_division = (m["ring"], m["division"])
+                    if st.session_state.get("div_ring") != m["ring"]:
+                        st.session_state.pending_div_ring = m["ring"]
+                    st.rerun()
+
+    # Global Space-key listener for the divisions Next match button.
+    if not div_matches_df.empty and len(div_matches_df) > 1:
+        space_js = """
+        <script>
+        (function() {
+            const win = window.parent;
+            const doc = win.document;
+            if (win.__pwnDivSpaceHandlerInstalled) return;
+            win.__pwnDivSpaceHandlerInstalled = true;
+            doc.addEventListener("keydown", (e) => {
+                if (e.code !== "Space" && e.key !== " ") return;
+                const tag = (e.target && e.target.tagName) || "";
+                if (tag === "INPUT" || tag === "TEXTAREA" || (e.target && e.target.isContentEditable)) return;
+                const buttons = doc.querySelectorAll('button');
+                for (const b of buttons) {
+                    if (b.innerText && b.innerText.includes("Next match")) {
+                        e.preventDefault();
+                        b.click();
+                        return;
+                    }
+                }
+            }, true);
+        })();
+        </script>
+        """
+        st.components.v1.html(space_js, height=0)
+
+    st.markdown("**Jump to ring:**")
+    ring_jump_buttons("div_ring", "div_jump")
+
+    ring_pick_d = st.selectbox("Ring (or pick from dropdown)", sb.ALL_RINGS, key="div_ring")
     ring_df = schedule[schedule["ring"] == ring_pick_d].sort_values("order_in_ring")
 
     if ring_df.empty:
@@ -191,31 +1009,71 @@ with tab_divisions:
 
         st.markdown(f"**{len(divisions_in_order)} divisions on {ring_pick_d}**")
 
-        # Stable labels (no times embedded) so the sortable widget's cached
-        # state always matches the current schedule. Times are shown in a
-        # separate read-only table below.
-        div_labels = []
+        all_div_labels = []
         label_to_div = {}
         for div in divisions_in_order:
             div_rows = ring_df[ring_df["division"] == div]
             n = len(div_rows)
             label = f"{div}  ({n} athletes)"
-            div_labels.append(label)
+            all_div_labels.append(label)
             label_to_div[label] = div
+
+        # Window mode: when a division on this ring is highlighted, show only
+        # ±5 divisions around it so the match is visible without scrolling.
+        hl_div_pair = st.session_state.get("highlight_division")
+        div_window_mode = (
+            hl_div_pair is not None
+            and hl_div_pair[0] == ring_pick_d
+            and hl_div_pair[1] in divisions_in_order
+        )
+
+        if div_window_mode:
+            center = divisions_in_order.index(hl_div_pair[1])
+            start = max(0, center - 5)
+            end = min(len(all_div_labels), center + 6)
+            div_labels = all_div_labels[start:end]
+            div_window_offset = start
+            st.warning(
+                f"🎯 Showing divisions **{start + 1}–{end}** of {len(all_div_labels)} on **{ring_pick_d}** "
+                f"(centered on the highlighted division). "
+                f"Drag-and-drop is disabled in this view — clear the search to re-enable."
+            )
+        else:
+            div_labels = all_div_labels
+            div_window_offset = 0
 
         st.caption("Drag a division block to a new position. Times for the moved block and every block below it update automatically.")
 
-        # Bump the key after each commit so the widget reinitializes with the
-        # new ordering. Stored counter lives in session_state.
         commit_counter_key = f"div_commits_{ring_pick_d}"
         if commit_counter_key not in st.session_state:
             st.session_state[commit_counter_key] = 0
-        sortable_key = f"sortable_div_{ring_pick_d}_{st.session_state[commit_counter_key]}"
+        suffix = f"_win{div_window_offset}" if div_window_mode else ""
+        sortable_key = f"sortable_div_{ring_pick_d}_{st.session_state[commit_counter_key]}{suffix}"
 
-        new_label_order = sort_items(div_labels, direction="vertical", key=sortable_key)
+        div_color_map_d = sb.division_colors(divisions_in_order)
+        item_css_d = []
+        for visible_idx, lbl in enumerate(div_labels, start=1):
+            div = label_to_div[lbl]
+            color = div_color_map_d.get(div, "#FFFFFF")
+            extra = ""
+            if div_window_mode and div == hl_div_pair[1]:
+                extra = "outline: 4px solid #D81B60 !important; outline-offset: -4px !important; font-weight: 800 !important;"
+            item_css_d.append(
+                f'.sortable-component .sortable-item:nth-of-type({visible_idx})'
+                f',.sortable-component .sortable-item:nth-of-type({visible_idx}):hover'
+                f' {{ background-color: {color} !important; color: #000000 !important; '
+                f'border: 1px solid #888 !important; {extra} }}'
+            )
+        custom_style_d = "\n".join(item_css_d)
 
-        # Auto-apply when the order has actually changed.
-        if new_label_order and new_label_order != div_labels:
+        new_label_order = sort_items(div_labels, direction="vertical", key=sortable_key, custom_style=custom_style_d)
+
+        # Auto-apply only when not in window mode (full list visible).
+        if (
+            not div_window_mode
+            and new_label_order
+            and new_label_order != div_labels
+        ):
             new_div_order = [label_to_div[lbl] for lbl in new_label_order]
             st.session_state.schedule = sb.reorder_divisions(schedule, ring_pick_d, new_div_order)
             save_schedule(st.session_state.schedule)
@@ -225,14 +1083,15 @@ with tab_divisions:
         # Read-only times table that always reflects the current schedule.
         st.markdown("**Current times after most recent reorder:**")
         time_rows = []
-        # Re-read schedule (it may have just been updated above before rerun, but we land here only when no change).
         live = st.session_state.schedule
         live_ring = live[live["ring"] == ring_pick_d].sort_values("order_in_ring")
         seen_t = set()
+        live_divs_in_order = []
         for _, r in live_ring.iterrows():
             if r["division"] in seen_t:
                 continue
             seen_t.add(r["division"])
+            live_divs_in_order.append(r["division"])
             div_rows = live_ring[live_ring["division"] == r["division"]]
             time_rows.append({
                 "Division": r["division"],
@@ -241,11 +1100,21 @@ with tab_divisions:
                 "Starts": div_rows.iloc[0]["start_time"],
                 "Ends": div_rows.iloc[-1]["end_time"],
             })
-        st.dataframe(pd.DataFrame(time_rows), width="stretch", hide_index=True)
+        time_df = pd.DataFrame(time_rows)
+        ring_colors = sb.division_colors(live_divs_in_order)
+
+        def _time_row_style(row):
+            color = ring_colors.get(row["Division"], "#FFFFFF")
+            return [f"background-color: {color}; color: #000000"] * len(row)
+
+        st.dataframe(time_df.style.apply(_time_row_style, axis=1), width="stretch", hide_index=True)
 
 with tab_move:
     st.subheader("Move a Division to Another Ring")
     st.caption("Pick a division on a source ring, choose a destination ring, and decide where in the destination ring it should land. Both rings recompute their schedules automatically.")
+
+    st.markdown("**Jump to source ring:**")
+    ring_jump_buttons("mv_src", "mv_jump")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -326,6 +1195,567 @@ with tab_move:
             save_schedule(st.session_state.schedule)
             st.success(f"Moved {div_size[chosen_div]} athletes in '{chosen_div}' to {dest_ring}.")
             st.rerun()
+
+
+with tab_add:
+    st.subheader("Add a New Athlete")
+    st.caption("Manually add an athlete to the schedule. They will be placed at the end of the chosen division's block on the appropriate ring, and times will recompute automatically.")
+
+    # Build a sorted list of existing divisions, grouped by ring for clarity.
+    existing_divs = sorted(schedule["division"].dropna().unique().tolist())
+
+    with st.form("add_athlete_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            new_name = st.text_input("Athlete name", placeholder="e.g. Jane Doe")
+            new_school = st.text_input("School (optional)", placeholder="e.g. Phoenix Wushu Academy")
+        with col2:
+            div_mode = st.radio(
+                "Division",
+                ["Existing division", "New division"],
+                horizontal=True,
+                key="add_div_mode",
+            )
+            if div_mode == "Existing division":
+                chosen_div = st.selectbox("Pick existing division", existing_divs, key="add_existing_div")
+                chosen_ring = None  # inferred from existing entries
+                chosen_event = None
+            else:
+                chosen_div = st.text_input("New division name", placeholder="e.g. T201 - Custom Form")
+                chosen_ring = st.selectbox("Ring (required for new division)", sb.ALL_RINGS, key="add_new_ring")
+                chosen_event = st.text_input(
+                    "Event category (optional)",
+                    placeholder="e.g. Wushu Taolu Event: Traditional Wushu Hand Forms",
+                )
+                if not chosen_event:
+                    chosen_event = None
+
+        submitted = st.form_submit_button("➕ Add Athlete", type="primary")
+
+    if submitted:
+        if not new_name.strip():
+            st.error("Athlete name is required.")
+        elif not chosen_div or not chosen_div.strip():
+            st.error("Division is required.")
+        else:
+            try:
+                st.session_state.schedule = sb.add_athlete(
+                    schedule,
+                    athlete=new_name,
+                    school=new_school,
+                    division=chosen_div.strip(),
+                    ring=chosen_ring,
+                    event_category=chosen_event,
+                )
+                save_schedule(st.session_state.schedule)
+                placed = st.session_state.schedule[
+                    (st.session_state.schedule["athlete"] == new_name.strip())
+                    & (st.session_state.schedule["division"] == chosen_div.strip())
+                ]
+                if not placed.empty:
+                    row = placed.iloc[-1]
+                    st.success(
+                        f"✅ Added **{new_name}** to **{chosen_div}** on **{row['ring']}** "
+                        f"— scheduled {row['day']} {row['start_time']}–{row['end_time']}"
+                    )
+                else:
+                    st.success(f"Added {new_name} to {chosen_div}.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+
+with tab_search:
+    st.subheader("Search for an Athlete")
+    st.caption("Type any part of an athlete's name. The matching schedule entries (event, division, ring, day, time) will appear below.")
+
+    query = st.text_input("Athlete name (partial match, case-insensitive)", key="search_query", placeholder="e.g. Brad Wu, Smith, Jorge")
+
+    if query and query.strip():
+        q = query.strip().lower()
+        matches = schedule[schedule["athlete"].astype(str).str.lower().str.contains(q, na=False)]
+
+        if matches.empty:
+            st.warning(f"No athletes matching '{query}'.")
+        else:
+            unique_athletes = sorted(matches["athlete"].unique())
+            st.success(f"Found {len(unique_athletes)} athlete(s) matching '{query}' with {len(matches)} scheduled entries.")
+
+            for athlete in unique_athletes:
+                ath_rows = matches[matches["athlete"] == athlete].sort_values(["day", "start_time"])
+                st.markdown(f"### 👤 {athlete}")
+                school = ath_rows.iloc[0]["school"]
+                if school:
+                    st.caption(f"School: {school}")
+
+                # Build a color map (per ring) for this athlete's rows.
+                div_color_map_s = {}
+                for ring in ath_rows["ring"].unique():
+                    ring_view = schedule[schedule["ring"] == ring].sort_values("order_in_ring")
+                    divs_in_order = []
+                    seen = set()
+                    for d in ring_view["division"]:
+                        if d not in seen:
+                            divs_in_order.append(d)
+                            seen.add(d)
+                    for div, color in sb.division_colors(divs_in_order).items():
+                        div_color_map_s[(ring, div)] = color
+
+                # One row at a time so each gets its own "Jump to" button next to it.
+                for _, ath_row in ath_rows.iterrows():
+                    entry_id = int(ath_row["entry_id"])
+                    color = div_color_map_s.get((ath_row["ring"], ath_row["division"]), "#FFFFFF")
+                    cols = st.columns([1.2, 1.2, 1.2, 2, 4, 3, 1.2])
+                    style = f"background-color:{color};color:#000;padding:6px 8px;border-radius:6px;display:block;"
+                    with cols[0]:
+                        st.markdown(f'<div style="{style}">{ath_row["day"]}</div>', unsafe_allow_html=True)
+                    with cols[1]:
+                        st.markdown(f'<div style="{style}">{ath_row["start_time"]}</div>', unsafe_allow_html=True)
+                    with cols[2]:
+                        st.markdown(f'<div style="{style}">{ath_row["end_time"]}</div>', unsafe_allow_html=True)
+                    with cols[3]:
+                        st.markdown(f'<div style="{style}">{ath_row["ring"]}</div>', unsafe_allow_html=True)
+                    with cols[4]:
+                        st.markdown(f'<div style="{style}">{ath_row["event_category"]}</div>', unsafe_allow_html=True)
+                    with cols[5]:
+                        st.markdown(f'<div style="{style}">{ath_row["division"]}</div>', unsafe_allow_html=True)
+                    with cols[6]:
+                        if st.button("📋 Jump", key=f"jump_{entry_id}", help="Set Schedule View filters to this row and highlight it. Then click the 📋 Schedule View tab."):
+                            st.session_state.pending_view_rings = [ath_row["ring"]]
+                            st.session_state.pending_view_day = ath_row["day"]
+                            st.session_state.highlight_entry_id = entry_id
+                            st.toast(f"Filters set — click the 📋 Schedule View tab to see {athlete} on {ath_row['ring']} at {ath_row['start_time']}.", icon="✅")
+                            st.rerun()
+
+                # Flag if this athlete has any time conflicts.
+                ath_conflicts = conflicts_df[conflicts_df["athlete"] == athlete] if not conflicts_df.empty else pd.DataFrame()
+                if not ath_conflicts.empty:
+                    st.warning(f"⚠️ {len(ath_conflicts)} time conflict(s) for {athlete}. See the Conflicts tab.")
+
+
+with tab_sim:
+    st.subheader("🎬 Tournament Simulation")
+    st.caption(
+        "Click **Start** to simulate the tournament beginning at 9:00 AM Saturday. "
+        "Mark each athlete **Complete** (or **Absent**) on each ring as they finish. "
+        "If they finish early, the schedule shifts up; if they run long, downstream times shift back."
+    )
+
+    # ------ Simulation state ------
+    # sim_running: ticking the wall clock
+    # sim_wall_start: real UNIX seconds when Start was clicked (None = idle)
+    # sim_paused_offset: accumulated simulated seconds while paused
+    # sim_speed: real-time multiplier
+    # ring_state: { ring_name: {
+    #     "current_idx": int,           # index in sorted-by-order_in_ring entries (today)
+    #     "current_started_min": int,   # simulated minute at which current athlete began
+    #     "log": [ {entry_id, athlete, division, status, started, finished, duration} ],
+    # } }
+    if "sim_running" not in st.session_state:
+        st.session_state.sim_running = False
+    if "sim_wall_start" not in st.session_state:
+        st.session_state.sim_wall_start = None
+    if "sim_speed" not in st.session_state:
+        st.session_state.sim_speed = 1
+    if "sim_paused_offset" not in st.session_state:
+        st.session_state.sim_paused_offset = 0
+    if "sim_ring_state" not in st.session_state:
+        st.session_state.sim_ring_state = {}
+
+    SIM_DAY_START_HOUR = 9
+    SIM_SAT_BASE_MIN = SIM_DAY_START_HOUR * 60
+
+    def _min_to_clock(m):
+        h = int(m // 60) % 24
+        mi = int(m % 60)
+        return f"{h:02d}:{mi:02d}"
+
+    def _sim_seconds_now():
+        if st.session_state.sim_wall_start is None:
+            return 0
+        if st.session_state.sim_running:
+            import time as _time
+            elapsed_real = _time.time() - st.session_state.sim_wall_start
+            return st.session_state.sim_paused_offset + elapsed_real * st.session_state.sim_speed
+        return st.session_state.sim_paused_offset
+
+    def _sim_minutes_in_day_now(sim_seconds):
+        """Return (day_label, minutes_from_midnight)."""
+        total_min = sim_seconds / 60.0
+        if total_min < 24 * 60:
+            return "Saturday", SIM_SAT_BASE_MIN + total_min
+        return "Sunday", SIM_SAT_BASE_MIN + (total_min - 24 * 60)
+
+    def _ring_state(ring):
+        if ring not in st.session_state.sim_ring_state:
+            st.session_state.sim_ring_state[ring] = {
+                "current_idx": 0,
+                "current_started_min": None,
+                "log": [],
+                # When set, the current athlete has finished but the user
+                # hasn't entered a score yet. Until pending_score is None,
+                # the ring is locked on this athlete (no Start/Complete/Absent).
+                "pending_score": None,
+            }
+        rs = st.session_state.sim_ring_state[ring]
+        rs.setdefault("pending_score", None)  # backfill for older state
+        return rs
+
+    def _start_athlete_on_ring(ring, sim_now_min, queue):
+        """Mark the next pending athlete as in progress."""
+        rs = _ring_state(ring)
+        if rs["current_idx"] >= len(queue):
+            return
+        # Use the larger of "scheduled start" or "now" for the start time.
+        sched_start = _time_to_min_safe(queue.iloc[rs["current_idx"]]["start_time"]) or sim_now_min
+        rs["current_started_min"] = max(int(sim_now_min), sched_start)
+
+    def _time_to_min_safe(t):
+        try:
+            hh, mm = str(t).split(":")
+            return int(hh) * 60 + int(mm)
+        except (ValueError, AttributeError):
+            return None
+
+    # ------ Controls ------
+    ctrl_a, ctrl_b, ctrl_c, ctrl_d = st.columns([1.2, 1.2, 1.2, 2.4])
+    with ctrl_a:
+        if not st.session_state.sim_running:
+            if st.button("▶️ Start", key="sim_start", type="primary", width="stretch"):
+                import time as _time
+                st.session_state.sim_running = True
+                st.session_state.sim_wall_start = _time.time()
+                st.session_state.sim_paused_offset = 0
+                st.session_state.sim_ring_state = {}  # reset per-ring queues
+                st.rerun()
+        else:
+            if st.button("⏸️ Pause", key="sim_pause", width="stretch"):
+                import time as _time
+                elapsed_real = _time.time() - st.session_state.sim_wall_start
+                st.session_state.sim_paused_offset += elapsed_real * st.session_state.sim_speed
+                st.session_state.sim_running = False
+                st.rerun()
+
+    with ctrl_b:
+        if st.button("⏹️ Reset", key="sim_reset", width="stretch"):
+            st.session_state.sim_running = False
+            st.session_state.sim_wall_start = None
+            st.session_state.sim_paused_offset = 0
+            st.session_state.sim_ring_state = {}
+            st.rerun()
+
+    with ctrl_c:
+        st.session_state.sim_speed = st.selectbox(
+            "Speed",
+            [1, 5, 10, 30, 60, 300],
+            index=[1, 5, 10, 30, 60, 300].index(st.session_state.sim_speed),
+            format_func=lambda x: f"{x}× real time",
+            key="sim_speed_pick",
+        )
+
+    with ctrl_d:
+        st.markdown(
+            "Use **✅ Complete** when an athlete finishes (early or late updates downstream times). "
+            "Use **❌ Absent** to skip them."
+        )
+
+    # ------ Live panel (clock + ring queues + log) ------
+    # Wrapped in st.fragment so only this block reruns every second.
+    # The Start/Pause/Reset/Speed controls above live OUTSIDE the fragment,
+    # so they never get dimmed by the auto-tick. Buttons inside use
+    # st.rerun(scope="fragment") to stay snappy.
+    tick_interval = "1s" if st.session_state.sim_running else None
+
+    @st.fragment(run_every=tick_interval)
+    def _sim_live_panel():
+        sim_seconds = _sim_seconds_now()
+        sim_day_label, minutes_into_day = _sim_minutes_in_day_now(sim_seconds)
+        sim_clock_str = _min_to_clock(minutes_into_day)
+        sim_now_min = int(minutes_into_day)
+
+        # ------ Big clock + status ------
+        cdt1, cdt2 = st.columns([1, 3])
+        with cdt1:
+            st.markdown(
+                _clock_face_svg(sim_clock_str, f"{sim_day_label}", ring_color="#D81B60"),
+                unsafe_allow_html=True,
+            )
+        with cdt2:
+            if st.session_state.sim_running:
+                status = "🟢 **RUNNING**"
+            elif st.session_state.sim_wall_start is not None:
+                status = "🟡 **PAUSED**"
+            else:
+                status = "⚪ **IDLE** (click Start to begin)"
+            st.markdown(f"### {status}")
+            st.markdown(f"**Simulated time:** {sim_day_label} {sim_clock_str}")
+            st.markdown(f"**Speed:** {st.session_state.sim_speed}× real time")
+
+        st.divider()
+
+        # ------ Per-ring panels with Complete/Absent buttons ------
+        if st.session_state.sim_wall_start is not None:
+            st.markdown("### 🎯 Active queue per ring")
+
+            for ring in sb.ALL_RINGS:
+                ring_color = RING_BORDER_COLORS.get(ring, "#666")
+                icon = RING_ICONS.get(ring, "")
+
+                queue = (
+                    schedule[(schedule["ring"] == ring) & (schedule["day"] == sim_day_label)]
+                    .sort_values("order_in_ring")
+                    .reset_index(drop=True)
+                )
+
+                rs = _ring_state(ring)
+                cur_idx = rs["current_idx"]
+
+                # The user explicitly starts each athlete via the ▶️ Start button
+                # below — we never auto-start.
+                current_row = queue.iloc[cur_idx] if cur_idx < len(queue) else None
+                next_row = queue.iloc[cur_idx + 1] if cur_idx + 1 < len(queue) else None
+
+                ring_slot = sb.slot_for_ring(ring)
+
+                # Render the ring header.
+                rcol1, rcol2 = st.columns([1, 6])
+                with rcol1:
+                    st.markdown(
+                        f'<div style="border-left:6px solid {ring_color};padding:6px 12px;'
+                        f'border-radius:4px;background:#f5f5f5;color:#222;font-weight:700;">'
+                        f'{icon} {ring}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with rcol2:
+                    done = sum(1 for e in rs["log"] if e["status"] in ("complete", "absent"))
+                    total = len(queue)
+                    st.markdown(
+                        f"Progress: **{done}/{total}** — {len([e for e in rs['log'] if e['status'] == 'absent'])} absent."
+                    )
+
+                if current_row is None:
+                    st.markdown(
+                        f'<div style="background:#f0f0f0;color:#555;padding:6px 10px;'
+                        f'border-radius:6px;">No more athletes on {ring} today.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.write("")
+                    continue
+
+                # Determine "started_at" for current athlete.
+                started_at = rs["current_started_min"]
+                sched_start = _time_to_min_safe(current_row["start_time"]) or sim_now_min
+                projected_start = started_at if started_at is not None else max(sim_now_min, sched_start)
+                projected_end = projected_start + ring_slot
+
+                in_progress = (started_at is not None and started_at <= sim_now_min)
+
+                # Athletes are capped at the ring's slot duration. Once their
+                # elapsed time hits the slot length, auto-flip into the scoring
+                # state — the user enters a score before we advance.
+                if in_progress and sim_now_min >= started_at + ring_slot and rs["pending_score"] is None:
+                    rs["pending_score"] = {
+                        "entry_id": int(current_row["entry_id"]),
+                        "athlete": current_row["athlete"],
+                        "division": current_row["division"],
+                        "started_min": started_at,
+                        "finished_min": started_at + ring_slot,
+                        "duration_min": ring_slot,
+                        "auto_capped": True,
+                    }
+                    st.rerun(scope="fragment")
+
+                pending = rs["pending_score"]
+
+                if pending is not None:
+                    # ----- Scoring panel: athlete just finished, awaiting a score -----
+                    cap_msg = " (auto-completed at cap)" if pending.get("auto_capped") else ""
+                    scols = st.columns([5, 2.2, 1.6])
+                    with scols[0]:
+                        st.markdown(
+                            f'<div style="background:#e3f0ff;color:#000;padding:8px 12px;'
+                            f'border-radius:6px;border:2px solid #1F5FBF;">'
+                            f'<b>📝 ENTER SCORE:</b> {pending["athlete"]} — {pending["division"]}<br/>'
+                            f'<small>Finished at {_min_to_clock(pending["finished_min"])} • Duration {pending["duration_min"]} min{cap_msg}</small>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                    with scols[1]:
+                        score_val = st.text_input(
+                            "Score",
+                            key=f"sim_score_input_{ring}_{cur_idx}",
+                            placeholder="e.g. 9.45",
+                            label_visibility="collapsed",
+                        )
+                    with scols[2]:
+                        if st.button("💾 Save Score", key=f"sim_save_score_{ring}_{cur_idx}",
+                                     type="primary", width="stretch",
+                                     help="Save the score and advance to the next athlete."):
+                            score_str = (score_val or "").strip()
+                            # Write the score onto the schedule row keyed by entry_id.
+                            sched = st.session_state.schedule
+                            sched.loc[sched["entry_id"] == pending["entry_id"], "score"] = score_str
+                            save_schedule(sched)
+                            rs["log"].append({
+                                "entry_id": pending["entry_id"],
+                                "athlete": pending["athlete"],
+                                "division": pending["division"],
+                                "status": "complete",
+                                "started_min": pending["started_min"],
+                                "finished_min": pending["finished_min"],
+                                "duration_min": pending["duration_min"],
+                                "score": score_str,
+                            })
+                            rs["current_idx"] += 1
+                            rs["current_started_min"] = None
+                            rs["pending_score"] = None
+                            st.rerun(scope="fragment")
+                else:
+                    # ----- Standard NOW/READY card + Start/Complete/Absent buttons -----
+                    ccols = st.columns([5, 1.5, 1.5, 1.5])
+                    with ccols[0]:
+                        if in_progress:
+                            elapsed = max(0, sim_now_min - started_at)
+                            remaining = max(0, ring_slot - elapsed)
+                            st.markdown(
+                                f'<div style="background:#dff5e0;color:#000;padding:8px 12px;'
+                                f'border-radius:6px;border:2px solid #2E7D32;">'
+                                f'<b>NOW:</b> {current_row["athlete"]} — {current_row["division"]}<br/>'
+                                f'<small>Started {_min_to_clock(started_at)} • Sched {current_row["start_time"]}–{current_row["end_time"]}</small><br/>'
+                                f'<small>⏱️ {elapsed}/{ring_slot} min ({remaining} min remaining — auto-completes at cap)</small>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f'<div style="background:#fffceb;color:#000;padding:8px 12px;'
+                                f'border-radius:6px;border:2px solid #B58900;">'
+                                f'<b>READY:</b> {current_row["athlete"]} — {current_row["division"]}<br/>'
+                                f'<small>Sched {current_row["start_time"]}–{current_row["end_time"]} • click ▶️ Start when this athlete begins</small>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                    with ccols[1]:
+                        # ▶️ Start button is only enabled when no one is currently in progress.
+                        start_disabled = in_progress
+                        if st.button("▶️ Start", key=f"sim_start_athlete_{ring}_{cur_idx}",
+                                     width="stretch", disabled=start_disabled,
+                                     help="Click when this athlete starts performing." if not start_disabled else "Already in progress."):
+                            rs["current_started_min"] = sim_now_min
+                            st.rerun(scope="fragment")
+                    with ccols[2]:
+                        # ✅ Complete is only enabled while in progress; flips into the score-entry state.
+                        if st.button("✅ Complete", key=f"sim_done_{ring}_{cur_idx}", type="primary",
+                                     width="stretch", disabled=not in_progress,
+                                     help="Click when this athlete finishes." if in_progress else "Click ▶️ Start first."):
+                            finished_at = sim_now_min
+                            actual_start = started_at if started_at is not None else sim_now_min
+                            duration = max(0, finished_at - actual_start)
+                            rs["pending_score"] = {
+                                "entry_id": int(current_row["entry_id"]),
+                                "athlete": current_row["athlete"],
+                                "division": current_row["division"],
+                                "started_min": actual_start,
+                                "finished_min": finished_at,
+                                "duration_min": duration,
+                                "auto_capped": False,
+                            }
+                            st.rerun(scope="fragment")
+                    with ccols[3]:
+                        # ❌ Absent only when not in progress (skip the ready athlete).
+                        if st.button("❌ Absent", key=f"sim_absent_{ring}_{cur_idx}",
+                                     width="stretch", disabled=in_progress,
+                                     help="Skip this athlete and move to the next." if not in_progress else "Already in progress."):
+                            sched = st.session_state.schedule
+                            sched.loc[sched["entry_id"] == int(current_row["entry_id"]), "score"] = "ABSENT"
+                            save_schedule(sched)
+                            rs["log"].append({
+                                "entry_id": int(current_row["entry_id"]),
+                                "athlete": current_row["athlete"],
+                                "division": current_row["division"],
+                                "status": "absent",
+                                "started_min": None,
+                                "finished_min": sim_now_min,
+                                "duration_min": 0,
+                                "score": "ABSENT",
+                            })
+                            rs["current_idx"] += 1
+                            rs["current_started_min"] = None
+                            st.rerun(scope="fragment")
+
+                # ----- Forecast: next 10 athletes with projected times -----
+                # Project start of athlete N+1 = projected end of current athlete.
+                # Each subsequent athlete adds one ring_slot. Drift = projected vs scheduled.
+                projected_current_end = (
+                    started_at + ring_slot if in_progress
+                    else max(sim_now_min, sched_start) + ring_slot
+                )
+                forecast_html = []
+                for i in range(1, 11):
+                    fc_idx = cur_idx + i
+                    if fc_idx >= len(queue):
+                        break
+                    fc = queue.iloc[fc_idx]
+                    proj_start = projected_current_end + (i - 1) * ring_slot
+                    proj_end = proj_start + ring_slot
+                    fc_sched_min = _time_to_min_safe(fc["start_time"])
+                    if fc_sched_min is not None:
+                        drift = proj_start - fc_sched_min
+                        if drift > 0:
+                            drift_str = f'<span style="color:#c0392b;">+{drift}m late</span>'
+                        elif drift < 0:
+                            drift_str = f'<span style="color:#27ae60;">{drift}m ahead</span>'
+                        else:
+                            drift_str = '<span style="color:#7f8c8d;">on time</span>'
+                    else:
+                        drift_str = ""
+                    forecast_html.append(
+                        f'<tr style="border-top:1px solid #eee;">'
+                        f'<td style="padding:3px 8px;color:#888;width:34px;text-align:right;">#{i}</td>'
+                        f'<td style="padding:3px 8px;font-family:monospace;width:110px;color:#222;">'
+                        f'{_min_to_clock(proj_start)}–{_min_to_clock(proj_end)}</td>'
+                        f'<td style="padding:3px 8px;color:#222;">{fc["athlete"]}</td>'
+                        f'<td style="padding:3px 8px;color:#666;font-size:0.9em;">{fc["division"]}</td>'
+                        f'<td style="padding:3px 8px;font-size:0.85em;text-align:right;width:90px;">{drift_str}</td>'
+                        f'</tr>'
+                    )
+
+                if forecast_html:
+                    st.markdown(
+                        f'<div style="margin-top:6px;">'
+                        f'<div style="font-size:0.82em;color:#666;font-weight:600;padding:0 4px 2px;">'
+                        f'📋 NEXT {len(forecast_html)} (projected from current pace):</div>'
+                        f'<table style="width:100%;border-collapse:collapse;background:#fafafa;'
+                        f'border-radius:6px;border:1px solid #ddd;">'
+                        + "".join(forecast_html) +
+                        f'</table></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                st.write("")  # spacing between rings
+
+            # Optional: show recent activity log
+            with st.expander("📜 Activity log (latest 30 actions across all rings)"):
+                log_rows = []
+                for ring, rs in st.session_state.sim_ring_state.items():
+                    for entry in rs["log"]:
+                        log_rows.append({
+                            "Ring": ring,
+                            "Status": entry["status"],
+                            "Athlete": entry["athlete"],
+                            "Division": entry["division"],
+                            "Started": _min_to_clock(entry["started_min"]) if entry["started_min"] is not None else "—",
+                            "Finished": _min_to_clock(entry["finished_min"]),
+                            "Duration (min)": entry["duration_min"],
+                            "Score": entry.get("score", ""),
+                        })
+                if log_rows:
+                    log_df = pd.DataFrame(log_rows).sort_values("Finished", ascending=False).head(30)
+                    st.dataframe(log_df, width="stretch", hide_index=True)
+                else:
+                    st.caption("No actions yet. Mark an athlete Complete or Absent to populate the log.")
+
+    _sim_live_panel()
 
 
 with tab_conflicts:
