@@ -15,6 +15,27 @@ import schedule_builder as sb
 APP_DIR = Path(__file__).parent
 CSV_PATH = APP_DIR / "registrations.csv"
 STATE_PATH = APP_DIR / "schedule_state.json"
+# Separate file holding the live simulator state. The viewer dashboard polls
+# both this file and STATE_PATH to render a real-time read-only schedule.
+SIM_STATE_PATH = APP_DIR / "sim_state.json"
+
+
+def write_sim_state_snapshot():
+    """Persist the live sim state to disk so the viewer dashboard can read it.
+    Called whenever the user touches the sim (start/pause/reset/score/absent)
+    or once per fragment tick so the viewer's polling stays accurate."""
+    snapshot = {
+        "sim_running": bool(st.session_state.get("sim_running", False)),
+        "sim_wall_start": st.session_state.get("sim_wall_start"),
+        "sim_speed": st.session_state.get("sim_speed", 1),
+        "sim_paused_offset": st.session_state.get("sim_paused_offset", 0),
+        "sim_ring_state": st.session_state.get("sim_ring_state", {}),
+    }
+    try:
+        with open(SIM_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, default=str)
+    except OSError:
+        pass  # non-fatal — viewer just stays on its last cached read
 
 st.set_page_config(
     page_title="Terry's Event Schedule",
@@ -56,6 +77,17 @@ if "score" not in st.session_state.schedule.columns:
     st.session_state.schedule["score"] = ""
 else:
     st.session_state.schedule["score"] = st.session_state.schedule["score"].fillna("")
+
+# Backfill age_group from dob for older saved JSONs (or rows missing it).
+if "age_group" not in st.session_state.schedule.columns:
+    st.session_state.schedule["age_group"] = st.session_state.schedule["dob"].apply(sb.compute_age_group)
+else:
+    st.session_state.schedule["age_group"] = st.session_state.schedule["age_group"].fillna("")
+    needs_fill = st.session_state.schedule["age_group"].astype(str).str.len() == 0
+    if needs_fill.any():
+        st.session_state.schedule.loc[needs_fill, "age_group"] = (
+            st.session_state.schedule.loc[needs_fill, "dob"].apply(sb.compute_age_group)
+        )
 
 
 # Promote any pending widget values that were staged on a previous run
@@ -482,7 +514,7 @@ st.caption("Interactive Schedule Dashboard | 8 Rings × 2 Days")
 
 tab_view, tab_athletes, tab_divisions, tab_move, tab_add, tab_search, tab_sim, tab_conflicts = st.tabs(
     ["📋 Schedule View", "👤 Edit Athletes", "🏷️ Edit Divisions",
-     "🔀 Move Division to Another Ring", "➕ Add Athlete", "🔍 Search Athlete",
+     "🔀 Move Division to Another Ring", "➕ Add / 🗑️ Delete Athlete", "🔍 Search Athlete",
      "🎬 Simulate", "⚠️ Conflicts"]
 )
 
@@ -579,9 +611,11 @@ with tab_view:
                     st.session_state.highlight_entry_id = None
                     st.rerun()
 
-        display_cols = ["entry_id", "day", "ring", "start_time", "end_time", "athlete", "school", "event_category", "division", "score"]
+        display_cols = ["entry_id", "day", "ring", "start_time", "end_time", "athlete", "age_group", "school", "event_category", "division", "score"]
         if "score" not in view_df.columns:
             view_df = view_df.assign(score="")
+        if "age_group" not in view_df.columns:
+            view_df = view_df.assign(age_group="")
         display_df = view_df[display_cols].rename(columns={
             "entry_id": "_eid",
             "day": "Day",
@@ -589,6 +623,7 @@ with tab_view:
             "start_time": "Start",
             "end_time": "End",
             "athlete": "Athlete",
+            "age_group": "Age Group",
             "school": "School",
             "event_category": "Event",
             "division": "Division",
@@ -1204,58 +1239,106 @@ with tab_add:
     # Build a sorted list of existing divisions, grouped by ring for clarity.
     existing_divs = sorted(schedule["division"].dropna().unique().tolist())
 
+    NEW_DIV_SENTINEL = "✏️ Type a new division name…"
+
+    from datetime import date as _date
+    DOB_MIN = _date(1920, 1, 1)
+    DOB_MAX = _date.today()
+    DOB_DEFAULT = _date(2010, 1, 1)  # neutral mid-range default; user must change
+
     with st.form("add_athlete_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
             new_name = st.text_input("Athlete name", placeholder="e.g. Jane Doe")
             new_school = st.text_input("School (optional)", placeholder="e.g. Phoenix Wushu Academy")
-        with col2:
-            div_mode = st.radio(
-                "Division",
-                ["Existing division", "New division"],
-                horizontal=True,
-                key="add_div_mode",
+            new_dob = st.date_input(
+                "Date of birth (required — auto-assigns age group G1–G12)",
+                value=DOB_DEFAULT,
+                min_value=DOB_MIN,
+                max_value=DOB_MAX,
+                key="add_dob",
+                format="YYYY-MM-DD",
             )
-            if div_mode == "Existing division":
-                chosen_div = st.selectbox("Pick existing division", existing_divs, key="add_existing_div")
-                chosen_ring = None  # inferred from existing entries
-                chosen_event = None
+        with col2:
+            # Single combobox-style picker: existing divisions + a sentinel
+            # row that reveals a free-text input for typing a new name.
+            div_options = [NEW_DIV_SENTINEL] + existing_divs
+            picked_div = st.selectbox(
+                "Division",
+                div_options,
+                key="add_div_picker",
+                help="Pick from existing divisions or choose the top option to type a brand-new one.",
+            )
+            typed_div = st.text_input(
+                "Division name (used when typing a new one — leave blank to use dropdown selection)",
+                key="add_div_typed",
+                placeholder="e.g. T201 - Custom Form",
+            )
+
+            # If the user typed something, the typed name wins. Otherwise use
+            # the dropdown selection — but ignore the sentinel.
+            if typed_div.strip():
+                chosen_div = typed_div.strip()
+                is_new_div = chosen_div not in existing_divs
+            elif picked_div != NEW_DIV_SENTINEL:
+                chosen_div = picked_div
+                is_new_div = False
             else:
-                chosen_div = st.text_input("New division name", placeholder="e.g. T201 - Custom Form")
-                chosen_ring = st.selectbox("Ring (required for new division)", sb.ALL_RINGS, key="add_new_ring")
-                chosen_event = st.text_input(
-                    "Event category (optional)",
-                    placeholder="e.g. Wushu Taolu Event: Traditional Wushu Hand Forms",
-                )
-                if not chosen_event:
-                    chosen_event = None
+                chosen_div = ""  # sentinel selected but nothing typed → caught below
+                is_new_div = True
+
+            # New-division extras (ring is mandatory; event is optional). For
+            # an existing division they're inferred and these inputs are
+            # ignored. Always-render keeps the form layout stable.
+            chosen_ring = st.selectbox(
+                "Ring (required only for a new division)",
+                ["(auto — infer from existing)"] + list(sb.ALL_RINGS),
+                key="add_new_ring",
+            )
+            chosen_event = st.text_input(
+                "Event category (optional, new divisions only)",
+                key="add_new_event",
+                placeholder="e.g. Wushu Taolu Event: Traditional Wushu Hand Forms",
+            )
 
         submitted = st.form_submit_button("➕ Add Athlete", type="primary")
 
     if submitted:
         if not new_name.strip():
             st.error("Athlete name is required.")
-        elif not chosen_div or not chosen_div.strip():
-            st.error("Division is required.")
+        elif new_dob is None:
+            st.error("Date of birth is required.")
+        elif new_dob == DOB_DEFAULT:
+            st.error(f"Please change the date of birth from the default ({DOB_DEFAULT.isoformat()}) to the athlete's actual birthdate.")
+        elif not chosen_div:
+            st.error("Division is required — pick one from the dropdown or type a new name.")
+        elif is_new_div and chosen_ring == "(auto — infer from existing)":
+            st.error(f"'{chosen_div}' is a new division — please pick a ring for it.")
         else:
+            ring_arg = None if chosen_ring == "(auto — infer from existing)" else chosen_ring
+            event_arg = chosen_event.strip() or None
+            dob_iso = new_dob.isoformat()
+            assigned_ag = sb.compute_age_group(dob_iso)
             try:
                 st.session_state.schedule = sb.add_athlete(
                     schedule,
                     athlete=new_name,
                     school=new_school,
-                    division=chosen_div.strip(),
-                    ring=chosen_ring,
-                    event_category=chosen_event,
+                    division=chosen_div,
+                    ring=ring_arg if is_new_div else None,
+                    event_category=event_arg if is_new_div else None,
+                    dob=dob_iso,
                 )
                 save_schedule(st.session_state.schedule)
                 placed = st.session_state.schedule[
                     (st.session_state.schedule["athlete"] == new_name.strip())
-                    & (st.session_state.schedule["division"] == chosen_div.strip())
+                    & (st.session_state.schedule["division"] == chosen_div)
                 ]
                 if not placed.empty:
                     row = placed.iloc[-1]
                     st.success(
-                        f"✅ Added **{new_name}** to **{chosen_div}** on **{row['ring']}** "
+                        f"✅ Added **{new_name}** (DOB {dob_iso} → **{assigned_ag or 'no age group'}**) "
+                        f"to **{chosen_div}** on **{row['ring']}** "
                         f"— scheduled {row['day']} {row['start_time']}–{row['end_time']}"
                     )
                 else:
@@ -1263,6 +1346,73 @@ with tab_add:
                 st.rerun()
             except ValueError as e:
                 st.error(str(e))
+
+    st.divider()
+    st.subheader("🗑️ Delete an Athlete")
+    st.caption("Search for an athlete and remove one or more of their scheduled entries. Times for the affected ring(s) will recompute automatically.")
+
+    del_query = st.text_input(
+        "Athlete name (partial match, case-insensitive)",
+        key="del_query",
+        placeholder="e.g. Brad Wu, Smith, Jorge",
+    )
+
+    if del_query and del_query.strip():
+        q = del_query.strip().lower()
+        del_matches = schedule[schedule["athlete"].astype(str).str.lower().str.contains(q, na=False)].copy()
+
+        if del_matches.empty:
+            st.warning(f"No athletes matching '{del_query}'.")
+        else:
+            del_matches = del_matches.sort_values(["athlete", "day", "start_time"]).reset_index(drop=True)
+            st.success(f"Found {len(del_matches)} entry(ies) across {del_matches['athlete'].nunique()} athlete(s).")
+
+            # Build a stable label per row so the user can tell which entry they're deleting.
+            def _row_label(r):
+                return (
+                    f"{r['athlete']} • {r['division']} • {r['ring']} • "
+                    f"{r['day']} {r['start_time']}–{r['end_time']}"
+                    + (f" • DOB {r['dob']}" if r.get("dob") else "")
+                )
+            del_matches["__label"] = del_matches.apply(_row_label, axis=1)
+
+            select_all = st.checkbox(
+                "Select all matching entries (deletes every row above)",
+                key="del_select_all",
+            )
+            if select_all:
+                chosen_labels = del_matches["__label"].tolist()
+                st.info(f"All {len(chosen_labels)} entries selected for deletion.")
+            else:
+                chosen_labels = st.multiselect(
+                    "Pick the entries to delete",
+                    options=del_matches["__label"].tolist(),
+                    key="del_multiselect",
+                )
+
+            chosen_eids = del_matches.loc[del_matches["__label"].isin(chosen_labels), "entry_id"].tolist()
+
+            confirm_text = st.text_input(
+                f"To confirm, type DELETE (deletes {len(chosen_eids)} entry(ies))",
+                key="del_confirm",
+                placeholder="DELETE",
+            )
+            disabled = (len(chosen_eids) == 0) or (confirm_text.strip().upper() != "DELETE")
+            if st.button("🗑️ Delete selected", key="del_submit", type="primary", disabled=disabled):
+                target = st.session_state.schedule
+                affected_rings = sorted(set(target.loc[target["entry_id"].isin(chosen_eids), "ring"].tolist()))
+                # Drop the rows.
+                target = target[~target["entry_id"].isin(chosen_eids)].copy()
+                # Recompute times on each affected ring (renumber preserves order_in_ring's relative ordering).
+                for r in affected_rings:
+                    target = sb.renumber_ring(target, r)
+                st.session_state.schedule = target
+                save_schedule(st.session_state.schedule)
+                st.success(f"Deleted {len(chosen_eids)} entry(ies). Recomputed times on: {', '.join(affected_rings)}.")
+                # Clear the search/multiselect so the form resets cleanly.
+                for k in ("del_query", "del_multiselect", "del_select_all", "del_confirm"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
 
 with tab_search:
@@ -1434,6 +1584,10 @@ with tab_sim:
                 elapsed_real = _time.time() - st.session_state.sim_wall_start
                 st.session_state.sim_paused_offset += elapsed_real * st.session_state.sim_speed
                 st.session_state.sim_running = False
+                # Push the paused state to disk so the viewer stops showing
+                # "running" — the live fragment won't re-tick once paused, so
+                # we have to write here.
+                write_sim_state_snapshot()
                 st.rerun()
 
     with ctrl_b:
@@ -1442,6 +1596,19 @@ with tab_sim:
             st.session_state.sim_wall_start = None
             st.session_state.sim_paused_offset = 0
             st.session_state.sim_ring_state = {}
+            # Clear every score / ABSENT marker the simulator wrote so both
+            # dashboards return to the unstarted state. Use .loc on the
+            # session-state DataFrame directly so the assignment is unambiguously
+            # in-place, then save AND reload to make sure session and disk match.
+            sched = st.session_state.schedule
+            sched.loc[:, "score"] = ""
+            save_schedule(sched)
+            st.session_state.schedule = load_or_build_schedule()
+            st.session_state.schedule["score"] = (
+                st.session_state.schedule.get("score", "").fillna("").astype(str)
+            )
+            write_sim_state_snapshot()
+            st.toast("Simulator reset — all scores cleared.", icon="🧹")
             st.rerun()
 
     with ctrl_c:
@@ -1468,6 +1635,10 @@ with tab_sim:
 
     @st.fragment(run_every=tick_interval)
     def _sim_live_panel():
+        # Push the latest sim state to disk on every tick so the viewer
+        # dashboard can read it. This is cheap (small JSON, no remote IO).
+        write_sim_state_snapshot()
+
         sim_seconds = _sim_seconds_now()
         sim_day_label, minutes_into_day = _sim_minutes_in_day_now(sim_seconds)
         sim_clock_str = _min_to_clock(minutes_into_day)

@@ -76,13 +76,70 @@ def load_registrations(csv_path):
     df["athlete"] = df["Athlete"].astype(str).str.strip()
     df["school"] = df["School"].fillna("").astype(str).str.strip()
     df["dob"] = df["DoB"].astype(str).str.strip()
+    df["age_group"] = df["dob"].apply(compute_age_group)
 
     df = df[df["athlete"].str.len() > 0]
     df = df[df["division"].str.len() > 0]
 
     df = df.reset_index(drop=True)
     df["entry_id"] = df.index
-    return df[["entry_id", "athlete", "school", "dob", "event_category", "division"]]
+    return df[["entry_id", "athlete", "school", "dob", "age_group", "event_category", "division"]]
+
+
+# Age-group banding per the tournament's rule sheet. (low, high_inclusive, label)
+AGE_GROUP_BANDS = [
+    (0, 6, "G1 (≤6)"),
+    (7, 8, "G2 (7-8)"),
+    (9, 10, "G3 (9-10)"),
+    (11, 12, "G4 (11-12)"),
+    (13, 14, "G5 (13-14)"),
+    (15, 16, "G6 (15-16)"),
+    (17, 18, "G7 (17-18)"),
+    (19, 25, "G8 (19-25)"),
+    (26, 30, "G9 (26-30)"),
+    (31, 36, "G10 (31-36)"),
+    (37, 55, "G11 (37-55)"),
+    (56, 999, "G12 (56+)"),
+]
+# Map each age-group label to a 1..12 rank for sorting (youngest first).
+_AGE_GROUP_RANK = {label: i for i, (_, _, label) in enumerate(AGE_GROUP_BANDS)}
+
+
+def _parse_dob(dob_str):
+    """Try the common DOB string formats. Returns a date or None."""
+    s = (dob_str or "").strip()
+    if not s or s.lower() in ("nan", "nat", "none"):
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    # Pandas fallback handles a wide variety of inputs.
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.notna(ts):
+            return ts.date()
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def compute_age_group(dob_str, ref_date=None):
+    """Return the G1..G12 label for an athlete's date of birth.
+    ref_date defaults to today; pass an explicit date to anchor on the event."""
+    if ref_date is None:
+        ref_date = datetime.now().date()
+    dob = _parse_dob(dob_str)
+    if dob is None:
+        return ""
+    age = ref_date.year - dob.year - ((ref_date.month, ref_date.day) < (dob.month, dob.day))
+    if age < 0:
+        return ""
+    for lo, hi, label in AGE_GROUP_BANDS:
+        if lo <= age <= hi:
+            return label
+    return ""
 
 
 def classify_ring(event_category):
@@ -228,9 +285,15 @@ def build_schedule(df, slot_minutes=None):
         ring_slot = slot_minutes if slot_minutes is not None else slot_for_ring(ring)
 
         ring_df["__div_letter"] = ring_df["division"].astype(str).str.strip().str[:1].str.upper()
+        # Within a single division, group athletes by age band (youngest first)
+        # so heats run G1 → G12. Athletes without a parseable DOB sort last
+        # (rank 999) so they don't disrupt the age ordering.
+        if "age_group" not in ring_df.columns:
+            ring_df["age_group"] = ring_df.get("dob", "").apply(compute_age_group)
+        ring_df["__age_rank"] = ring_df["age_group"].map(_AGE_GROUP_RANK).fillna(999).astype(int)
         ring_df = ring_df.sort_values(
-            ["__div_letter", "division", "athlete"]
-        ).drop(columns="__div_letter").reset_index(drop=True)
+            ["__div_letter", "division", "__age_rank", "athlete"]
+        ).drop(columns=["__div_letter", "__age_rank"]).reset_index(drop=True)
 
         balance = ring in BALANCE_RINGS
         split_at = _split_point_for_balance(len(ring_df), ring_slot) if balance else None
@@ -485,7 +548,7 @@ def move_division_to_ring(schedule, division, source_ring, dest_ring, position="
     return schedule
 
 
-def add_athlete(schedule, athlete, school, division, ring=None, event_category=None):
+def add_athlete(schedule, athlete, school, division, ring=None, event_category=None, dob=""):
     """
     Add a new athlete to the schedule, placed at the end of the matching
     division block on the appropriate ring. Times are recomputed for that
@@ -535,11 +598,13 @@ def add_athlete(schedule, athlete, school, division, ring=None, event_category=N
     bump_mask = (schedule["ring"] == ring) & (schedule["order_in_ring"] > insert_after_order)
     schedule.loc[bump_mask, "order_in_ring"] = schedule.loc[bump_mask, "order_in_ring"] + 1
 
+    dob_str = (dob or "").strip()
     new_row = {
         "entry_id": new_entry_id,
         "athlete": athlete.strip(),
         "school": (school or "").strip(),
-        "dob": "",
+        "dob": dob_str,
+        "age_group": compute_age_group(dob_str) if dob_str else "",
         "event_category": event_category,
         "division": division,
         "ring": ring,

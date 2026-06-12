@@ -118,12 +118,65 @@ def load_registrations(csv_path):
     df["athlete"] = df["Athlete"].astype(str).str.strip()
     df["school"] = df["School"].fillna("").astype(str).str.strip()
     df["dob"] = df["DoB"].astype(str).str.strip()
+    df["age_group"] = df["dob"].apply(compute_age_group)
 
     df = df[df["athlete"].str.len() > 0]
     df = df[df["division"].str.len() > 0]
     df = df.reset_index(drop=True)
     df["entry_id"] = df.index
-    return df[["entry_id", "athlete", "school", "dob", "event_category", "division"]]
+    return df[["entry_id", "athlete", "school", "dob", "age_group", "event_category", "division"]]
+
+
+AGE_GROUP_BANDS = [
+    (0, 6, "G1 (≤6)"),
+    (7, 8, "G2 (7-8)"),
+    (9, 10, "G3 (9-10)"),
+    (11, 12, "G4 (11-12)"),
+    (13, 14, "G5 (13-14)"),
+    (15, 16, "G6 (15-16)"),
+    (17, 18, "G7 (17-18)"),
+    (19, 25, "G8 (19-25)"),
+    (26, 30, "G9 (26-30)"),
+    (31, 36, "G10 (31-36)"),
+    (37, 55, "G11 (37-55)"),
+    (56, 999, "G12 (56+)"),
+]
+_AGE_GROUP_RANK = {label: i for i, (_, _, label) in enumerate(AGE_GROUP_BANDS)}
+
+
+def _parse_dob(dob_str):
+    s = (dob_str or "").strip()
+    if not s or s.lower() in ("nan", "nat", "none"):
+        return None
+    from datetime import datetime as _dt
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return _dt.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.notna(ts):
+            return ts.date()
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def compute_age_group(dob_str, ref_date=None):
+    if ref_date is None:
+        from datetime import datetime as _dt
+        ref_date = _dt.now().date()
+    dob = _parse_dob(dob_str)
+    if dob is None:
+        return ""
+    age = ref_date.year - dob.year - ((ref_date.month, ref_date.day) < (dob.month, dob.day))
+    if age < 0:
+        return ""
+    for lo, hi, label in AGE_GROUP_BANDS:
+        if lo <= age <= hi:
+            return label
+    return ""
 
 
 def classify_ring(event_category):
@@ -205,9 +258,13 @@ def build_schedule(df, slot_minutes=None):
         ring_slot = slot_minutes if slot_minutes is not None else slot_for_ring(ring)
 
         ring_df["__div_letter"] = ring_df["division"].astype(str).str.strip().str[:1].str.upper()
+        # Sort youngest age band first within each division so heats run G1 → G12.
+        if "age_group" not in ring_df.columns:
+            ring_df["age_group"] = ring_df.get("dob", "").apply(compute_age_group)
+        ring_df["__age_rank"] = ring_df["age_group"].map(_AGE_GROUP_RANK).fillna(999).astype(int)
         ring_df = ring_df.sort_values(
-            ["__div_letter", "division", "athlete"]
-        ).drop(columns="__div_letter").reset_index(drop=True)
+            ["__div_letter", "division", "__age_rank", "athlete"]
+        ).drop(columns=["__div_letter", "__age_rank"]).reset_index(drop=True)
 
         balance = ring in BALANCE_RINGS
         split_at = _split_point_for_balance(len(ring_df), ring_slot) if balance else None
@@ -368,7 +425,7 @@ def move_division_to_ring(schedule, division, source_ring, dest_ring, position="
     return schedule
 
 
-def add_athlete(schedule, athlete, school, division, ring=None, event_category=None):
+def add_athlete(schedule, athlete, school, division, ring=None, event_category=None, dob=""):
     schedule = schedule.copy()
     div_rows = schedule[schedule["division"] == division]
 
@@ -401,11 +458,13 @@ def add_athlete(schedule, athlete, school, division, ring=None, event_category=N
     bump_mask = (schedule["ring"] == ring) & (schedule["order_in_ring"] > insert_after_order)
     schedule.loc[bump_mask, "order_in_ring"] = schedule.loc[bump_mask, "order_in_ring"] + 1
 
+    dob_str = (dob or "").strip()
     new_row = {
         "entry_id": new_entry_id,
         "athlete": athlete.strip(),
         "school": (school or "").strip(),
-        "dob": "",
+        "dob": dob_str,
+        "age_group": compute_age_group(dob_str) if dob_str else "",
         "event_category": event_category,
         "division": division,
         "ring": ring,
@@ -534,6 +593,17 @@ if "score" not in st.session_state.schedule.columns:
     st.session_state.schedule["score"] = ""
 else:
     st.session_state.schedule["score"] = st.session_state.schedule["score"].fillna("")
+
+# Backfill age_group from dob for older saved JSONs (or rows missing it).
+if "age_group" not in st.session_state.schedule.columns:
+    st.session_state.schedule["age_group"] = st.session_state.schedule["dob"].apply(compute_age_group)
+else:
+    st.session_state.schedule["age_group"] = st.session_state.schedule["age_group"].fillna("")
+    needs_fill = st.session_state.schedule["age_group"].astype(str).str.len() == 0
+    if needs_fill.any():
+        st.session_state.schedule.loc[needs_fill, "age_group"] = (
+            st.session_state.schedule.loc[needs_fill, "dob"].apply(compute_age_group)
+        )
 
 # Promote pending widget values that were staged on a previous run.
 for src, dst in [
@@ -917,7 +987,7 @@ st.caption("Interactive Schedule Dashboard | 8 Rings × 2 Days")
 
 tab_view, tab_athletes, tab_divisions, tab_move, tab_add, tab_search, tab_sim, tab_conflicts = st.tabs(
     ["📋 Schedule View", "👤 Edit Athletes", "🏷️ Edit Divisions",
-     "🔀 Move Division to Another Ring", "➕ Add Athlete", "🔍 Search Athlete",
+     "🔀 Move Division to Another Ring", "➕ Add / 🗑️ Delete Athlete", "🔍 Search Athlete",
      "🎬 Simulate", "⚠️ Conflicts"]
 )
 
@@ -1001,13 +1071,16 @@ with tab_view:
                     st.session_state.highlight_entry_id = None
                     st.rerun()
 
-        display_cols = ["entry_id", "day", "ring", "start_time", "end_time", "athlete", "school", "event_category", "division", "score"]
+        display_cols = ["entry_id", "day", "ring", "start_time", "end_time", "athlete", "age_group", "school", "event_category", "division", "score"]
         if "score" not in view_df.columns:
             view_df = view_df.assign(score="")
+        if "age_group" not in view_df.columns:
+            view_df = view_df.assign(age_group="")
         display_df = view_df[display_cols].rename(columns={
             "entry_id": "_eid",
             "day": "Day", "ring": "Ring", "start_time": "Start", "end_time": "End",
-            "athlete": "Athlete", "school": "School", "event_category": "Event", "division": "Division",
+            "athlete": "Athlete", "age_group": "Age Group", "school": "School",
+            "event_category": "Event", "division": "Division",
             "score": "Score",
         })
 
@@ -1562,58 +1635,99 @@ with tab_add:
 
     existing_divs = sorted(schedule["division"].dropna().unique().tolist())
 
+    NEW_DIV_SENTINEL = "✏️ Type a new division name…"
+
+    from datetime import date as _date
+    DOB_MIN = _date(1920, 1, 1)
+    DOB_MAX = _date.today()
+    DOB_DEFAULT = _date(2010, 1, 1)
+
     with st.form("add_athlete_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
             new_name = st.text_input("Athlete name", placeholder="e.g. Jane Doe")
             new_school = st.text_input("School (optional)", placeholder="e.g. Phoenix Wushu Academy")
-        with col2:
-            div_mode = st.radio(
-                "Division",
-                ["Existing division", "New division"],
-                horizontal=True,
-                key="add_div_mode",
+            new_dob = st.date_input(
+                "Date of birth (required — auto-assigns age group G1–G12)",
+                value=DOB_DEFAULT,
+                min_value=DOB_MIN,
+                max_value=DOB_MAX,
+                key="add_dob",
+                format="YYYY-MM-DD",
             )
-            if div_mode == "Existing division":
-                chosen_div = st.selectbox("Pick existing division", existing_divs, key="add_existing_div")
-                chosen_ring = None
-                chosen_event = None
+        with col2:
+            div_options = [NEW_DIV_SENTINEL] + existing_divs
+            picked_div = st.selectbox(
+                "Division",
+                div_options,
+                key="add_div_picker",
+                help="Pick from existing divisions or choose the top option to type a brand-new one.",
+            )
+            typed_div = st.text_input(
+                "Division name (used when typing a new one — leave blank to use dropdown selection)",
+                key="add_div_typed",
+                placeholder="e.g. T201 - Custom Form",
+            )
+
+            if typed_div.strip():
+                chosen_div = typed_div.strip()
+                is_new_div = chosen_div not in existing_divs
+            elif picked_div != NEW_DIV_SENTINEL:
+                chosen_div = picked_div
+                is_new_div = False
             else:
-                chosen_div = st.text_input("New division name", placeholder="e.g. T201 - Custom Form")
-                chosen_ring = st.selectbox("Ring (required for new division)", ALL_RINGS, key="add_new_ring")
-                chosen_event = st.text_input(
-                    "Event category (optional)",
-                    placeholder="e.g. Wushu Taolu Event: Traditional Wushu Hand Forms",
-                )
-                if not chosen_event:
-                    chosen_event = None
+                chosen_div = ""
+                is_new_div = True
+
+            chosen_ring = st.selectbox(
+                "Ring (required only for a new division)",
+                ["(auto — infer from existing)"] + list(ALL_RINGS),
+                key="add_new_ring",
+            )
+            chosen_event = st.text_input(
+                "Event category (optional, new divisions only)",
+                key="add_new_event",
+                placeholder="e.g. Wushu Taolu Event: Traditional Wushu Hand Forms",
+            )
 
         submitted = st.form_submit_button("➕ Add Athlete", type="primary")
 
     if submitted:
         if not new_name.strip():
             st.error("Athlete name is required.")
-        elif not chosen_div or not chosen_div.strip():
-            st.error("Division is required.")
+        elif new_dob is None:
+            st.error("Date of birth is required.")
+        elif new_dob == DOB_DEFAULT:
+            st.error(f"Please change the date of birth from the default ({DOB_DEFAULT.isoformat()}) to the athlete's actual birthdate.")
+        elif not chosen_div:
+            st.error("Division is required — pick one from the dropdown or type a new name.")
+        elif is_new_div and chosen_ring == "(auto — infer from existing)":
+            st.error(f"'{chosen_div}' is a new division — please pick a ring for it.")
         else:
+            ring_arg = None if chosen_ring == "(auto — infer from existing)" else chosen_ring
+            event_arg = chosen_event.strip() or None
+            dob_iso = new_dob.isoformat()
+            assigned_ag = compute_age_group(dob_iso)
             try:
                 st.session_state.schedule = add_athlete(
                     schedule,
                     athlete=new_name,
                     school=new_school,
-                    division=chosen_div.strip(),
-                    ring=chosen_ring,
-                    event_category=chosen_event,
+                    division=chosen_div,
+                    ring=ring_arg if is_new_div else None,
+                    event_category=event_arg if is_new_div else None,
+                    dob=dob_iso,
                 )
                 save_schedule(st.session_state.schedule)
                 placed = st.session_state.schedule[
                     (st.session_state.schedule["athlete"] == new_name.strip())
-                    & (st.session_state.schedule["division"] == chosen_div.strip())
+                    & (st.session_state.schedule["division"] == chosen_div)
                 ]
                 if not placed.empty:
                     row = placed.iloc[-1]
                     st.success(
-                        f"✅ Added **{new_name}** to **{chosen_div}** on **{row['ring']}** "
+                        f"✅ Added **{new_name}** (DOB {dob_iso} → **{assigned_ag or 'no age group'}**) "
+                        f"to **{chosen_div}** on **{row['ring']}** "
                         f"— scheduled {row['day']} {row['start_time']}–{row['end_time']}"
                     )
                 else:
@@ -1621,6 +1735,69 @@ with tab_add:
                 st.rerun()
             except ValueError as e:
                 st.error(str(e))
+
+    st.divider()
+    st.subheader("🗑️ Delete an Athlete")
+    st.caption("Search for an athlete and remove one or more of their scheduled entries. Times for the affected ring(s) will recompute automatically.")
+
+    del_query = st.text_input(
+        "Athlete name (partial match, case-insensitive)",
+        key="del_query",
+        placeholder="e.g. Brad Wu, Smith, Jorge",
+    )
+
+    if del_query and del_query.strip():
+        q = del_query.strip().lower()
+        del_matches = schedule[schedule["athlete"].astype(str).str.lower().str.contains(q, na=False)].copy()
+
+        if del_matches.empty:
+            st.warning(f"No athletes matching '{del_query}'.")
+        else:
+            del_matches = del_matches.sort_values(["athlete", "day", "start_time"]).reset_index(drop=True)
+            st.success(f"Found {len(del_matches)} entry(ies) across {del_matches['athlete'].nunique()} athlete(s).")
+
+            def _row_label(r):
+                return (
+                    f"{r['athlete']} • {r['division']} • {r['ring']} • "
+                    f"{r['day']} {r['start_time']}–{r['end_time']}"
+                    + (f" • DOB {r['dob']}" if r.get("dob") else "")
+                )
+            del_matches["__label"] = del_matches.apply(_row_label, axis=1)
+
+            select_all = st.checkbox(
+                "Select all matching entries (deletes every row above)",
+                key="del_select_all",
+            )
+            if select_all:
+                chosen_labels = del_matches["__label"].tolist()
+                st.info(f"All {len(chosen_labels)} entries selected for deletion.")
+            else:
+                chosen_labels = st.multiselect(
+                    "Pick the entries to delete",
+                    options=del_matches["__label"].tolist(),
+                    key="del_multiselect",
+                )
+
+            chosen_eids = del_matches.loc[del_matches["__label"].isin(chosen_labels), "entry_id"].tolist()
+
+            confirm_text = st.text_input(
+                f"To confirm, type DELETE (deletes {len(chosen_eids)} entry(ies))",
+                key="del_confirm",
+                placeholder="DELETE",
+            )
+            disabled = (len(chosen_eids) == 0) or (confirm_text.strip().upper() != "DELETE")
+            if st.button("🗑️ Delete selected", key="del_submit", type="primary", disabled=disabled):
+                target = st.session_state.schedule
+                affected_rings = sorted(set(target.loc[target["entry_id"].isin(chosen_eids), "ring"].tolist()))
+                target = target[~target["entry_id"].isin(chosen_eids)].copy()
+                for r in affected_rings:
+                    target = renumber_ring(target, r)
+                st.session_state.schedule = target
+                save_schedule(st.session_state.schedule)
+                st.success(f"Deleted {len(chosen_eids)} entry(ies). Recomputed times on: {', '.join(affected_rings)}.")
+                for k in ("del_query", "del_multiselect", "del_select_all", "del_confirm"):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
 
 with tab_search:
@@ -1780,6 +1957,14 @@ with tab_sim:
             st.session_state.sim_wall_start = None
             st.session_state.sim_paused_offset = 0
             st.session_state.sim_ring_state = {}
+            sched = st.session_state.schedule
+            sched.loc[:, "score"] = ""
+            save_schedule(sched)
+            st.session_state.schedule = load_or_build_schedule()
+            st.session_state.schedule["score"] = (
+                st.session_state.schedule.get("score", "").fillna("").astype(str)
+            )
+            st.toast("Simulator reset — all scores cleared.", icon="🧹")
             st.rerun()
 
     with ctrl_c:
